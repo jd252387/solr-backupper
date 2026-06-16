@@ -1,6 +1,6 @@
 solr:
   backup:
     zookeeper: zoo:2181
-    whitelist-collections:
+    whitelist-aliases:
       - Books
       - Products

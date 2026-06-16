@@ -14,15 +14,19 @@ import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.Collections;
+import java.util.List;
+import java.util.Map;
 import java.util.Optional;
-import java.util.function.Function;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.example.configuration.SolrBackupConfiguration;
 import org.apache.http.client.utils.URIBuilder;
 import org.apache.solr.client.solrj.impl.CloudSolrClient;
+import org.apache.solr.common.cloud.ClusterState;
+import org.apache.solr.common.cloud.DocCollection;
 import org.apache.solr.common.cloud.Replica;
 import org.apache.solr.common.cloud.Slice;
+import org.apache.solr.common.cloud.ZkStateReader;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
 import org.springframework.stereotype.Service;
@@ -114,7 +118,7 @@ public class Runner implements ApplicationRunner {
         }
     }
 
-    public Mono<Void> sendBackupRequest(Replica leader, Slice targetSlice) {
+    public Mono<Void> sendBackupRequest(Replica leader, Slice targetSlice, String alias) {
         try {
             var backupRequest = webClient
                     .get()
@@ -125,7 +129,7 @@ public class Runner implements ApplicationRunner {
                                     "location",
                                     Path.of(
                                                     solrBackupConfiguration.getBackupsMount(),
-                                                    targetSlice.getCollection(),
+                                                    alias,
                                                     targetSlice.getName())
                                             .toString()
                                             .replace("\\", "/"))
@@ -139,6 +143,7 @@ public class Runner implements ApplicationRunner {
                             .addKeyValue("shard_name", targetSlice.getName())
                             .addKeyValue("core_name", leader.getCoreName())
                             .addKeyValue("leader_url", leader.getCoreUrl())
+                            .addKeyValue("alias", alias)
                             .addKeyValue("collection", targetSlice.getCollection())
                             .log())
                     .then();
@@ -147,23 +152,25 @@ public class Runner implements ApplicationRunner {
         }
     }
 
-    private Mono<Void> startBackupForShard(Slice slice, Replica leader, String leaderUrl) {
+    private Mono<Void> startBackupForShard(Slice slice, Replica leader, String leaderUrl, String alias) {
         return Mono.defer(() -> {
                     log.atInfo()
                             .setMessage("Starting to backup shard")
                             .addKeyValue("shard_name", slice.getName())
                             .addKeyValue("core_name", leader.getCoreName())
                             .addKeyValue("leader_url", leaderUrl)
+                            .addKeyValue("alias", alias)
                             .addKeyValue("collection", slice.getCollection())
                             .log();
 
-                    return sendBackupRequest(leader, slice)
+                    return sendBackupRequest(leader, slice, alias)
                             .then(checkBackupStatus(leader, slice))
                             .doOnSuccess(signal -> log.atInfo()
                                     .setMessage("Finished backing-up shard")
                                     .addKeyValue("shard_name", slice.getName())
                                     .addKeyValue("core_name", leader.getCoreName())
                                     .addKeyValue("leader_url", leaderUrl)
+                                    .addKeyValue("alias", alias)
                                     .addKeyValue("collection", slice.getCollection())
                                     .log());
                 })
@@ -174,6 +181,7 @@ public class Runner implements ApplicationRunner {
                             .addKeyValue("shard_name", slice.getName())
                             .addKeyValue("core_name", leader.getCoreName())
                             .addKeyValue("leader_url", leaderUrl)
+                            .addKeyValue("alias", alias)
                             .addKeyValue("collection", slice.getCollection());
 
                     if (e instanceof WebClientResponseException responseException) {
@@ -186,6 +194,39 @@ public class Runner implements ApplicationRunner {
                 .onErrorComplete();
     }
 
+    private List<AliasTarget> resolveAlias(
+            String alias, Map<String, List<String>> aliasToCollections, ClusterState clusterState) {
+        List<String> collections = aliasToCollections.get(alias);
+
+        if (collections == null || collections.isEmpty()) {
+            log.atError()
+                    .setMessage("Alias not found in Solr or points to no collections")
+                    .addKeyValue("alias", alias)
+                    .log();
+            return List.of();
+        }
+        if (collections.size() > 1) {
+            log.atError()
+                    .setMessage("Alias points to multiple collections; skipping backup")
+                    .addKeyValue("alias", alias)
+                    .addKeyValue("collections", collections)
+                    .log();
+            return List.of();
+        }
+
+        String collectionName = collections.get(0);
+        DocCollection collection = clusterState.getCollectionOrNull(collectionName);
+        if (collection == null) {
+            log.atError()
+                    .setMessage("Collection referenced by alias not found in cluster state")
+                    .addKeyValue("alias", alias)
+                    .addKeyValue("collection", collectionName)
+                    .log();
+            return List.of();
+        }
+        return List.of(new AliasTarget(alias, collection));
+    }
+
     @Override
     public void run(ApplicationArguments args) throws IOException {
         log.info("Initiating backups");
@@ -193,33 +234,42 @@ public class Runner implements ApplicationRunner {
         try (CloudSolrClient client = new CloudSolrClient.Builder(
                         Collections.singletonList(solrBackupConfiguration.getZookeeper()), Optional.empty())
                 .build()) {
-            Flux.fromIterable(client.getClusterState().getCollectionsMap().values())
-                    .filter(collection -> !collection.getName().startsWith(".sys"))
-                    .filter(collection -> Optional.ofNullable(solrBackupConfiguration.getWhitelistCollections())
-                            .map(whitelist -> whitelist.contains(collection.getName()))
-                            .orElse(false))
+            ClusterState clusterState = client.getClusterState();
+            Map<String, List<String>> aliasToCollections =
+                    ZkStateReader.from(client).getAliases().getCollectionAliasListMap();
+
+            Flux.fromIterable(Optional.ofNullable(solrBackupConfiguration.getWhitelistAliases())
+                            .orElse(List.of()))
+                    .flatMapIterable(alias -> resolveAlias(alias, aliasToCollections, clusterState))
                     .delayElements(Duration.ofSeconds(15))
-                    .flatMapIterable(Function.identity())
-                    .<Slice>handle((slice, sink) -> {
+                    .flatMapIterable(target -> target.collection().getSlices().stream()
+                            .map(slice -> new AliasedSlice(target.alias(), slice))
+                            .toList())
+                    .<AliasedSlice>handle((aliasedSlice, sink) -> {
+                        Slice slice = aliasedSlice.slice();
                         try {
                             Files.createDirectories(Path.of(
-                                    solrBackupConfiguration.getBackupsMount(), slice.getCollection(), slice.getName()));
-                            sink.next(slice);
+                                    solrBackupConfiguration.getBackupsMount(),
+                                    aliasedSlice.alias(),
+                                    slice.getName()));
+                            sink.next(aliasedSlice);
                         } catch (IOException e) {
                             log.atError()
                                     .setMessage("Error while creating or checking for existence of backups directory")
                                     .addKeyValue("error", e)
+                                    .addKeyValue("alias", aliasedSlice.alias())
                                     .addKeyValue("collection", slice.getCollection())
                                     .addKeyValue("shard_name", slice.getName())
                                     .log();
                         }
                     })
                     .flatMap(
-                            slice -> {
+                            aliasedSlice -> {
+                                Slice slice = aliasedSlice.slice();
                                 Replica leader = slice.getLeader();
                                 String leaderUrl = leader.getCoreUrl();
 
-                                return startBackupForShard(slice, leader, leaderUrl);
+                                return startBackupForShard(slice, leader, leaderUrl, aliasedSlice.alias());
                             },
                             solrBackupConfiguration.getParallelBackups())
                     .subscribeOn(Schedulers.boundedElastic())
@@ -228,4 +278,8 @@ public class Runner implements ApplicationRunner {
             System.exit(0);
         }
     }
+
+    private record AliasTarget(String alias, DocCollection collection) {}
+
+    private record AliasedSlice(String alias, Slice slice) {}
 }

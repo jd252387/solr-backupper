@@ -12,7 +12,7 @@ import org.springframework.context.annotation.Configuration;
 @ConfigurationProperties("solr.backup")
 public class SolrBackupConfiguration {
     private String zookeeper;
-    private List<String> whitelistCollections;
+    private List<String> whitelistAliases;
     private String backupsMount;
     private int parallelBackups;
     private Duration statusEvery;
