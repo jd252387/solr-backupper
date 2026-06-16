@@ -9,6 +9,7 @@ import java.net.URISyntaxException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
@@ -21,6 +22,9 @@ import java.util.concurrent.TimeoutException;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.example.configuration.SolrBackupConfiguration;
+import org.example.report.BackupOutcome;
+import org.example.report.BackupReportWriter;
+import org.example.report.ShardBackupResult;
 import org.apache.http.client.utils.URIBuilder;
 import org.apache.solr.client.solrj.impl.CloudSolrClient;
 import org.apache.solr.common.cloud.ClusterState;
@@ -44,6 +48,7 @@ public class Runner implements ApplicationRunner {
     private final SolrBackupConfiguration solrBackupConfiguration;
     private final WebClient webClient;
     private final ObjectMapper objectMapper;
+    private final BackupReportWriter backupReportWriter;
 
     public boolean isEndTimeBelowAllowedDelta(LocalDateTime lastFinishedAt) {
         return Duration.between(lastFinishedAt, ZonedDateTime.now(ZoneOffset.UTC))
@@ -153,8 +158,24 @@ public class Runner implements ApplicationRunner {
         }
     }
 
-    private Mono<Void> startBackupForShard(Slice slice, Replica leader, String leaderUrl, String alias) {
+    private ShardBackupResult shardResult(
+            Slice slice, Replica leader, String leaderUrl, String alias, BackupOutcome outcome, Instant startedAt) {
+        return new ShardBackupResult(
+                alias,
+                slice.getCollection(),
+                slice.getName(),
+                leader.getCoreName(),
+                leaderUrl,
+                outcome,
+                startedAt,
+                Instant.now());
+    }
+
+    private Mono<ShardBackupResult> startBackupForShard(
+            Slice slice, Replica leader, String leaderUrl, String alias) {
         return Mono.defer(() -> {
+                    Instant startedAt = Instant.now();
+
                     log.atInfo()
                             .setMessage("Starting to backup shard")
                             .addKeyValue("shard_name", slice.getName())
@@ -167,14 +188,18 @@ public class Runner implements ApplicationRunner {
                     return sendBackupRequest(leader, slice, alias)
                             .then(checkBackupStatus(leader, slice))
                             .timeout(solrBackupConfiguration.getBackupTimeout())
-                            .doOnSuccess(signal -> log.atInfo()
-                                    .setMessage("Finished backing-up shard")
-                                    .addKeyValue("shard_name", slice.getName())
-                                    .addKeyValue("core_name", leader.getCoreName())
-                                    .addKeyValue("leader_url", leaderUrl)
-                                    .addKeyValue("alias", alias)
-                                    .addKeyValue("collection", slice.getCollection())
-                                    .log())
+                            .then(Mono.fromSupplier(() -> {
+                                log.atInfo()
+                                        .setMessage("Finished backing-up shard")
+                                        .addKeyValue("shard_name", slice.getName())
+                                        .addKeyValue("core_name", leader.getCoreName())
+                                        .addKeyValue("leader_url", leaderUrl)
+                                        .addKeyValue("alias", alias)
+                                        .addKeyValue("collection", slice.getCollection())
+                                        .log();
+                                return shardResult(
+                                        slice, leader, leaderUrl, alias, BackupOutcome.SUCCESS, startedAt);
+                            }))
                             .onErrorResume(TimeoutException.class, e -> {
                                 log.atWarn()
                                         .setMessage(
@@ -186,27 +211,29 @@ public class Runner implements ApplicationRunner {
                                         .addKeyValue("alias", alias)
                                         .addKeyValue("collection", slice.getCollection())
                                         .log();
-                                return Mono.empty();
+                                return Mono.fromSupplier(() -> shardResult(
+                                        slice, leader, leaderUrl, alias, BackupOutcome.TIMED_OUT, startedAt));
+                            })
+                            .onErrorResume(e -> {
+                                var errorLogBase = log.atError()
+                                        .setMessage("Encountered error while running backup for shard")
+                                        .addKeyValue("error", e.toString())
+                                        .addKeyValue("shard_name", slice.getName())
+                                        .addKeyValue("core_name", leader.getCoreName())
+                                        .addKeyValue("leader_url", leaderUrl)
+                                        .addKeyValue("alias", alias)
+                                        .addKeyValue("collection", slice.getCollection());
+
+                                if (e instanceof WebClientResponseException responseException) {
+                                    errorLogBase = errorLogBase.addKeyValue(
+                                            "response_message", responseException.getResponseBodyAsString());
+                                }
+
+                                errorLogBase.log();
+                                return Mono.fromSupplier(() -> shardResult(
+                                        slice, leader, leaderUrl, alias, BackupOutcome.ERROR, startedAt));
                             });
-                })
-                .doOnError(e -> {
-                    var errorLogBase = log.atError()
-                            .setMessage("Encountered error while running backup for shard")
-                            .addKeyValue("error", e.toString())
-                            .addKeyValue("shard_name", slice.getName())
-                            .addKeyValue("core_name", leader.getCoreName())
-                            .addKeyValue("leader_url", leaderUrl)
-                            .addKeyValue("alias", alias)
-                            .addKeyValue("collection", slice.getCollection());
-
-                    if (e instanceof WebClientResponseException responseException) {
-                        errorLogBase = errorLogBase.addKeyValue(
-                                "response_message", responseException.getResponseBodyAsString());
-                    }
-
-                    errorLogBase.log();
-                })
-                .onErrorComplete();
+                });
     }
 
     private List<AliasTarget> resolveAlias(
@@ -289,7 +316,9 @@ public class Runner implements ApplicationRunner {
                             solrBackupConfiguration.getParallelBackups())
                     .subscribeOn(Schedulers.boundedElastic())
                     .doOnComplete(() -> log.info("Finished backups"))
-                    .blockLast();
+                    .collectList()
+                    .doOnNext(backupReportWriter::writeReport)
+                    .block();
             System.exit(0);
         }
     }

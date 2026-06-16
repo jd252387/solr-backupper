@@ -5,6 +5,7 @@ solr:
     status-every: 2S
     max-end-time-delta: 30M
     backup-timeout: 30M
+    report-output-directory: /mnt/backups/backups/solr9/reports/
   auth:
     username: solr 
     password: admin
