@@ -18,4 +18,5 @@ public class SolrBackupConfiguration {
     private Duration statusEvery;
     private Duration maxEndTimeDelta;
     private Duration backupTimeout;
+    private String reportOutputDirectory;
 }
