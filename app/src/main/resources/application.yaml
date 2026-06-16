@@ -4,6 +4,7 @@ solr:
     backups-mount: /mnt/backups/backups/solr9/
     status-every: 2S
     max-end-time-delta: 30M
+    backup-timeout: 30M
   auth:
     username: solr 
     password: admin

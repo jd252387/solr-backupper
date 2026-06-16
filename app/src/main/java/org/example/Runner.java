@@ -17,6 +17,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.TimeoutException;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.example.configuration.SolrBackupConfiguration;
@@ -165,6 +166,7 @@ public class Runner implements ApplicationRunner {
 
                     return sendBackupRequest(leader, slice, alias)
                             .then(checkBackupStatus(leader, slice))
+                            .timeout(solrBackupConfiguration.getBackupTimeout())
                             .doOnSuccess(signal -> log.atInfo()
                                     .setMessage("Finished backing-up shard")
                                     .addKeyValue("shard_name", slice.getName())
@@ -172,7 +174,20 @@ public class Runner implements ApplicationRunner {
                                     .addKeyValue("leader_url", leaderUrl)
                                     .addKeyValue("alias", alias)
                                     .addKeyValue("collection", slice.getCollection())
-                                    .log());
+                                    .log())
+                            .onErrorResume(TimeoutException.class, e -> {
+                                log.atWarn()
+                                        .setMessage(
+                                                "Timed out waiting for shard backup to complete; moving on to next shard")
+                                        .addKeyValue("backup_timeout", solrBackupConfiguration.getBackupTimeout())
+                                        .addKeyValue("shard_name", slice.getName())
+                                        .addKeyValue("core_name", leader.getCoreName())
+                                        .addKeyValue("leader_url", leaderUrl)
+                                        .addKeyValue("alias", alias)
+                                        .addKeyValue("collection", slice.getCollection())
+                                        .log();
+                                return Mono.empty();
+                            });
                 })
                 .doOnError(e -> {
                     var errorLogBase = log.atError()
