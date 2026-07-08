@@ -4,5 +4,8 @@
 # Ignore Gradle build output directory
 build
 
+# Ignore IDE (VS Code / Eclipse JDT) compile output directory
+bin/
+
 # Ignore Kotlin plugin data
 .kotlin
