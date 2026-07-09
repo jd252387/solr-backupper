@@ -2,98 +2,176 @@
 package org.example.report;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.time.Instant;
 import java.util.List;
 import org.example.configuration.SolrBackupConfiguration;
+import org.example.dashboard.DashboardState;
+import org.example.dashboard.ShardStatus;
 import org.junit.Test;
+import org.springframework.core.env.StandardEnvironment;
 
 public class BackupReportWriterTest {
 
-    private BackupReportWriter newWriter(String reportOutputDirectory) {
+    private SolrBackupConfiguration config(String reportOutputDirectory) {
         SolrBackupConfiguration config = new SolrBackupConfiguration();
         config.setReportOutputDirectory(reportOutputDirectory);
-        return new BackupReportWriter(config, new ObjectMapper().findAndRegisterModules());
+        config.setParallelBackups(2);
+        return config;
     }
 
-    private ShardBackupResult result(
-            String alias,
-            String collection,
-            String shard,
-            BackupOutcome outcome,
-            long startEpochSeconds,
-            long endEpochSeconds) {
-        return new ShardBackupResult(
-                alias,
-                collection,
-                shard,
-                collection + "_" + shard + "_replica_n1",
-                "http://host:8983/solr/" + collection + "_" + shard + "_replica_n1/",
-                outcome,
-                Instant.ofEpochSecond(startEpochSeconds),
-                Instant.ofEpochSecond(endEpochSeconds));
+    // Cluster/environment (and the runId prefix) now come from the active Spring profile.
+    private DashboardState dashboardState() {
+        StandardEnvironment environment = new StandardEnvironment();
+        environment.setActiveProfiles("test-cluster");
+        return new DashboardState(environment);
+    }
+
+    private BackupReportWriter writer(SolrBackupConfiguration config, DashboardState state) {
+        return new BackupReportWriter(config, new ObjectMapper().findAndRegisterModules(), state);
+    }
+
+    private void register(DashboardState state, String alias, String collection, String shard) {
+        String core = collection + "_" + shard + "_replica_n1";
+        state.registerPending(alias, collection, shard, core, "http://host:8983/solr/" + core + "/");
+    }
+
+    private void succeed(DashboardState state, String alias, String shard) {
+        state.startAttempt(alias, shard, 1);
+        state.finishAttempt(alias, shard, ShardStatus.SUCCESS, null);
+        state.markShardResult(alias, shard, ShardStatus.SUCCESS, null);
+    }
+
+    private void fail(DashboardState state, String alias, String shard, String error) {
+        state.startAttempt(alias, shard, 1);
+        state.finishAttempt(alias, shard, ShardStatus.ERROR, error);
+        state.markShardResult(alias, shard, ShardStatus.ERROR, error);
     }
 
     @Test
-    public void buildsReportWithCountsListsAndPerAliasAverages() {
-        BackupReportWriter writer = newWriter("/tmp/unused");
+    public void buildsRunReportWithCountsGroupingAndDerivedStatus() {
+        SolrBackupConfiguration config = config("/tmp/unused");
+        DashboardState state = dashboardState();
 
-        List<ShardBackupResult> results = List.of(
-                result("Books", "books_v2", "shard1", BackupOutcome.SUCCESS, 0, 10),
-                result("Books", "books_v2", "shard2", BackupOutcome.SUCCESS, 0, 20),
-                result("Products", "products_v3", "shard1", BackupOutcome.TIMED_OUT, 0, 30),
-                result("Products", "products_v3", "shard2", BackupOutcome.ERROR, 0, 40));
+        register(state, "Books", "books_v2", "shard1");
+        succeed(state, "Books", "shard1");
+        register(state, "Books", "books_v2", "shard2");
+        succeed(state, "Books", "shard2");
+        register(state, "Products", "products_v3", "shard1");
+        fail(state, "Products", "shard1", "core stopped updating on backup");
+        register(state, "Products", "products_v3", "shard2");
+        fail(state, "Products", "shard2", "boom");
+        state.markRunFinished();
 
-        BackupReport report = writer.buildReport(results);
+        RunReport report = writer(config, state).buildReport();
 
-        assertEquals(2, report.replicasBackedUpSuccessfully());
-        assertEquals(1, report.replicasTimedOut());
-        assertEquals(1, report.replicasErrored());
+        assertEquals("test-cluster", report.cluster());
+        assertEquals("test-cluster", report.environment());
+        assertEquals(2, report.parallelBackups());
+        // runId is {clusterName}-{datetime}.
+        assertTrue(report.runId(), report.runId().startsWith("test-cluster-"));
+        // Any errored shard makes the whole (finished) run ERROR.
+        assertEquals(RunStatus.ERROR, report.status());
 
-        assertEquals(1, report.timedOutReplicas().size());
-        assertEquals("Products", report.timedOutReplicas().get(0).alias());
-        assertEquals("shard1", report.timedOutReplicas().get(0).shardName());
+        assertEquals(4, report.counts().total());
+        assertEquals(2, report.counts().success());
+        assertEquals(2, report.counts().errored());
+        assertEquals(0, report.counts().pending());
+        assertEquals(0, report.counts().running());
 
-        assertEquals(1, report.erroredReplicas().size());
-        assertEquals("shard2", report.erroredReplicas().get(0).shardName());
-
-        assertEquals(2, report.aliases().size());
-        BackupReport.AliasReport books = report.aliases().stream()
-                .filter(alias -> alias.alias().equals("Books"))
-                .findFirst()
-                .orElseThrow();
+        // Grouped by alias/collection, aliases sorted alphabetically (Books before Products).
+        assertEquals(2, report.collections().size());
+        RunReport.CollectionReport books = report.collections().get(0);
+        assertEquals("Books", books.alias());
         assertEquals("books_v2", books.collection());
-        assertEquals(Instant.ofEpochSecond(0), books.backupStartedAt());
-        assertEquals(Instant.ofEpochSecond(20), books.backupFinishedAt());
-        // (10s + 20s) / 2 shards
-        assertEquals(15.0, books.averageShardBackupSeconds(), 0.0001);
+        assertEquals(2, books.shards().size());
+        assertEquals("shard1", books.shards().get(0).shardName());
+        assertEquals(ShardStatus.SUCCESS, books.shards().get(0).status());
     }
 
     @Test
-    public void writesTimestampedJsonFile() throws Exception {
-        Path directory = Files.createTempDirectory("backup-report-test");
-        BackupReportWriter writer = newWriter(directory.toString());
+    public void activeRunReportsActiveStatusWhileShardsPending() {
+        SolrBackupConfiguration config = config("/tmp/unused");
+        DashboardState state = dashboardState();
+        register(state, "Books", "books_v2", "shard1");
+        state.startAttempt("Books", "shard1", 1);
+        register(state, "Books", "books_v2", "shard2"); // still PENDING, run not finished
 
-        writer.writeReport(List.of(result("Books", "books_v2", "shard1", BackupOutcome.SUCCESS, 0, 10)));
+        RunReport report = writer(config, state).buildReport();
 
-        List<Path> files;
+        assertEquals(RunStatus.ACTIVE, report.status());
+        assertEquals(1, report.counts().running());
+        assertEquals(1, report.counts().pending());
+    }
+
+    @Test
+    public void writesStableAtomicJsonFileRewrittenInPlace() throws Exception {
+        Path directory = Files.createTempDirectory("run-report-test");
+        SolrBackupConfiguration config = config(directory.toString());
+        DashboardState state = dashboardState();
+        register(state, "Books", "books_v2", "shard1");
+        succeed(state, "Books", "shard1");
+        state.markRunFinished();
+
+        BackupReportWriter writer = writer(config, state);
+        writer.writeReport();
+        writer.writeReport(); // second write must replace the same file, not create a new one
+
+        List<Path> jsonFiles;
         try (var stream = Files.list(directory)) {
-            files = stream.toList();
+            jsonFiles = stream.filter(p -> p.getFileName().toString().endsWith(".json")).toList();
         }
-        assertEquals(1, files.size());
+        assertEquals(1, jsonFiles.size());
 
-        String fileName = files.get(0).getFileName().toString();
-        assertTrue(fileName, fileName.startsWith("backup-report-") && fileName.endsWith(".json"));
+        String fileName = jsonFiles.get(0).getFileName().toString();
+        assertTrue(fileName, fileName.startsWith("backup-report-test-cluster-") && fileName.endsWith(".json"));
 
-        JsonNode node = new ObjectMapper().readTree(files.get(0).toFile());
-        assertEquals(1, node.get("replicasBackedUpSuccessfully").asInt());
-        assertEquals(0, node.get("replicasTimedOut").asInt());
-        assertEquals(1, node.get("aliases").size());
-        assertEquals("books_v2", node.get("aliases").get(0).get("collection").asText());
+        // No leftover temp files.
+        try (var stream = Files.list(directory)) {
+            assertFalse(stream.anyMatch(p -> p.getFileName().toString().endsWith(".tmp")));
+        }
+
+        JsonNode node = new ObjectMapper().readTree(jsonFiles.get(0).toFile());
+        assertEquals("test-cluster", node.get("cluster").asText());
+        assertEquals("SUCCESS", node.get("status").asText());
+        assertEquals(1, node.get("counts").get("success").asInt());
+        assertEquals("books_v2", node.get("collections").get(0).get("collection").asText());
+        assertTrue(node.get("runId").asText().startsWith("test-cluster-"));
+    }
+
+    @Test
+    public void shardThatSucceedsOnRetryIsSuccessWithEveryAttemptRecorded() {
+        SolrBackupConfiguration config = config("/tmp/unused");
+        DashboardState state = dashboardState();
+
+        // A shard that fails its first attempt and succeeds on the retry.
+        register(state, "Books", "books_v2", "shard1");
+        state.startAttempt("Books", "shard1", 1);
+        state.finishAttempt("Books", "shard1", ShardStatus.ERROR, "boom");
+        state.startAttempt("Books", "shard1", 2);
+        state.finishAttempt("Books", "shard1", ShardStatus.SUCCESS, null);
+        state.markShardResult("Books", "shard1", ShardStatus.SUCCESS, null);
+        state.markRunFinished();
+
+        RunReport report = writer(config, state).buildReport();
+
+        // Succeeding on retry makes the shard SUCCESS and the finished run SUCCESS.
+        assertEquals(RunStatus.SUCCESS, report.status());
+        assertEquals(1, report.counts().success());
+        assertEquals(0, report.counts().errored());
+
+        RunReport.ShardReport shard = report.collections().get(0).shards().get(0);
+        assertEquals(ShardStatus.SUCCESS, shard.status());
+        // Both attempts are recorded: first ERROR, then SUCCESS.
+        assertEquals(2, shard.attempts().size());
+        assertEquals(1, shard.attempts().get(0).attempt());
+        assertEquals(ShardStatus.ERROR, shard.attempts().get(0).status());
+        assertEquals("boom", shard.attempts().get(0).error());
+        assertEquals(ShardStatus.SUCCESS, shard.attempts().get(1).status());
     }
 }

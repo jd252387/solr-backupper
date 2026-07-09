@@ -1,11 +1,22 @@
+spring:
+  main:
+    # Pure run-and-exit CLI. spring-webflux + reactor-netty are on the classpath only to provide
+    # WebClient (an HTTP client against Solr); this stops Spring Boot from auto-starting a reactive web
+    # server. The dashboard is a separate container that reads the report directory.
+    web-application-type: none
+
 solr:
   backup:
-    parallel-backups: 30
+    parallel-backups: 2
+    retries: 2
+    retry-delay: 10S
     backups-mount: /mnt/backups/backups/solr9/
-    status-every: 2S
+    status-every: 10S
+    initial-status-delay: 3S
+    between-aliases-delay: 15S
     max-end-time-delta: 30M
-    backup-timeout: 30M
     report-output-directory: /mnt/backups/backups/solr9/reports/
+    report-update-interval: 5S
   auth:
-    username: solr 
+    username: solr
     password: admin

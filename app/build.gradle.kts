@@ -8,8 +8,9 @@
 plugins {
     // Apply the application plugin to add support for building a CLI application in Java.
     application
-    id("org.springframework.boot") version "3.2.5"
-    id("io.spring.dependency-management") version "1.1.4"
+    // 3.2.5's bootJar task calls a Gradle API removed in Gradle 9 (CopyProcessingSpec.getDirMode());
+    // 3.5.x is the latest 3.x line with Gradle 9 support, without jumping to the breaking Boot 4 major.
+    id("org.springframework.boot") version "3.5.16"
 }
 
 repositories {
@@ -18,6 +19,10 @@ repositories {
 }
 
 dependencies {
+    // Import the Spring Boot BOM directly (Gradle's native platform support) instead of the
+    // io.spring.dependency-management plugin, whose 1.1.x releases call a Gradle API removed in Gradle 9.
+    implementation(platform("org.springframework.boot:spring-boot-dependencies:3.5.16"))
+
     // Use JUnit test framework.
     testImplementation(libs.junit)
 
@@ -29,8 +34,37 @@ dependencies {
 	testCompileOnly("org.projectlombok:lombok:1.18.46")
 	testAnnotationProcessor("org.projectlombok:lombok:1.18.46")
 
-    implementation("org.springframework.boot:spring-boot-starter-web")
+    // Headless run-and-exit CLI (no web server): the core Boot starter for autoconfiguration + logging,
+    // and the JSON starter for Jackson (jackson-datatype-jsr310, used to serialize Instant into reports).
+    implementation("org.springframework.boot:spring-boot-starter")
+    implementation("org.springframework.boot:spring-boot-starter-json")
     implementation("io.projectreactor:reactor-core")
+    // WebClient is used purely as an HTTP client against Solr's replication handler — no server is ever
+    // started (spring.main.web-application-type=none). We pull in just the reactive-client pieces
+    // (spring-webflux + reactor-netty) rather than the full webflux starter.
+    implementation("org.springframework:spring-webflux")
+    implementation("io.projectreactor.netty:reactor-netty-http")
+    implementation("org.apache.solr:solr-solrj:9.10.1")
+    // CloudSolrClient/ZkStateReader (direct ZooKeeper cluster-state access) live in this separate module
+    // as of Solr 9's solrj split.
+    implementation("org.apache.solr:solr-solrj-zookeeper:9.10.1")
+}
+
+// The Spring Boot BOM's Jetty constraints (12.x, for its own optional embedded-Jetty support - unused
+// here, we run on Tomcat) otherwise force-upgrade solr-solrj's Jetty HTTP/2 client dependencies past what
+// Solr 9.10.1 was built against (10.0.26), breaking it at runtime (Jetty 12 removed the
+// org.eclipse.jetty.client.api package solr-solrj's CloudSolrClient relies on).
+configurations.all {
+    resolutionStrategy {
+        force(
+            "org.eclipse.jetty:jetty-http:10.0.26",
+            "org.eclipse.jetty:jetty-client:10.0.26",
+            "org.eclipse.jetty:jetty-util:10.0.26",
+            "org.eclipse.jetty:jetty-io:10.0.26",
+            "org.eclipse.jetty:jetty-alpn-java-client:10.0.26",
+            "org.eclipse.jetty:jetty-alpn-client:10.0.26",
+        )
+    }
 }
 
 // Apply a specific Java toolchain to ease working on different environments.

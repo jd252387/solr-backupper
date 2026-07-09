@@ -2,6 +2,7 @@
 package org.example.configuration;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
@@ -31,6 +32,9 @@ public class WebConfiguration {
 
     @Bean
     public ObjectMapper createObjectMapper() {
-        return new ObjectMapper();
+        // findAndRegisterModules() picks up jackson-datatype-jsr310 (already on the classpath via
+        // spring-boot-starter-json) so Instant fields serialize as ISO-8601 instead of falling back to
+        // reflection over Instant's own getEpochSecond()/getNano() accessors.
+        return new ObjectMapper().findAndRegisterModules().disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
     }
 }
