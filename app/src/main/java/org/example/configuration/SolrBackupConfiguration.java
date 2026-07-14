@@ -16,7 +16,6 @@ public class SolrBackupConfiguration {
     private String backupsMount;
     private int parallelBackups;
     private Duration statusEvery;
-    private Duration maxEndTimeDelta;
     private String reportOutputDirectory;
 
     /**
