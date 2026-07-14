@@ -50,14 +50,18 @@ Everything lives under `app/src/main/java/org/example/`. There is a single Gradl
      `System.exit(0)`s — pure run-and-exit, no keep-alive.
 - **`ShardBackupExecutor`** — executes one shard's backup: creates the on-disk backup directory
   (`{backups-mount}/{alias}/{shard}`), calls the shard leader replica's native Solr replication handler
-  (`?command=backup&location=...` to start, then repeatedly polls `?command=details` until the reported
-  backup `endTime` is recent enough — `isEndTimeBelowAllowedDelta`, guarding against reading a
-  stale/previous backup's completion — and `status=success`; a non-success status or an exception detail in
-  the response throws). A configurable `initial-status-delay` (default 3s) is applied before the first poll
-  so a just-triggered backup has time to register on the core. There is **no timeout** — polling continues
+  (`?command=backup&location=...` to start, then repeatedly polls `?command=details` until a backup whose
+  reported `startTime` is at or after the moment we triggered it — `startTime >= triggerTime`, distinguishing
+  our backup from any previous one whose completion is still being reported — has `status=success`; a
+  non-success status or an exception detail in the response throws). Before triggering, it polls
+  `?command=details` once and refuses to start (a retryable `A backup is already in progress on this core`
+  error) if a backup is already `In Progress`, because Solr does not serialize concurrent backups — a second
+  `command=backup` would run in parallel against a single shared status field. A configurable
+  `initial-status-delay` (default 3s) is applied before the first status poll so a just-triggered backup has
+  time to register on the core. There is **no timeout** — polling continues
   until the core reports success or failure. If a poll reports no backup at all (and none has finished),
   that is treated as a failure with the message `Core stopped updating on backup at <time>`. A failed
-  attempt is retried up to `retries` (default 2) times (`attemptBackup` wrapped in `Retry.max`); a shard
+  attempt is retried up to `retries` (default 2) times (`attemptBackup` wrapped in `Retry.fixedDelay`, waiting `retry-delay` — default 10s — between attempts); a shard
   that succeeds on any attempt is `SUCCESS`, and only a shard that fails every attempt is `ERROR`. Every
   attempt is recorded in `DashboardState` (`startAttempt`/`finishAttempt`, each with its own
   start/finish/error), and each failed attempt's partial snapshot is deleted from disk
@@ -68,7 +72,7 @@ Everything lives under `app/src/main/java/org/example/`. There is a single Gradl
   (alias/collection/shard/core/leader URL) rather than live Solr `Slice`/`Replica` objects.
 - **`configuration/SolrBackupConfiguration`** — `@ConfigurationProperties("solr.backup")`: zookeeper
   connection string, alias whitelist, backups mount path, parallelism, poll interval (`status-every`),
-  freshness window for the completion timestamp (`max-end-time-delta`), and report output directory.
+  and report output directory.
   `report-update-interval` (the live-write cadence), `initial-status-delay` (the wait before the first
   status poll, default 3s), `between-aliases-delay` (the stagger between aliases, default 15s), and
   `retries` (per-shard backup retries, default 2) carry in-code defaults so existing config still binds.

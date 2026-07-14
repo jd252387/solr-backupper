@@ -9,11 +9,9 @@ import java.io.UncheckedIOException;
 import java.net.URISyntaxException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
-import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.util.Comparator;
@@ -50,36 +48,59 @@ public class ShardBackupExecutor {
     private final ObjectMapper objectMapper;
     private final DashboardState dashboardState;
 
-    private boolean isEndTimeBelowAllowedDelta(LocalDateTime lastFinishedAt) {
-        return Duration.between(lastFinishedAt, ZonedDateTime.now(ZoneOffset.UTC))
-                        .compareTo(solrBackupConfiguration.getMaxEndTimeDelta())
-                <= 0;
+    /** Returns {@code details.backup} from a {@code command=details} response, or {@code null}. */
+    private static JsonNode backupNode(JsonNode responseNode) {
+        return Optional.ofNullable(responseNode.get("details"))
+                .map(detailsNode -> detailsNode.get("backup"))
+                .filter(node -> !node.isNull())
+                .orElse(null);
+    }
+
+    private static String exceptionSuffix(JsonNode backupNode) {
+        return Optional.ofNullable(backupNode.get("exception"))
+                .map(JsonNode::textValue)
+                .map(message -> " - " + message)
+                .orElse("");
+    }
+
+    /** True when the core's {@code command=details} reports a backup currently {@code In Progress}. */
+    boolean isBackupInProgress(JsonNode responseNode) {
+        JsonNode backupNode = backupNode(responseNode);
+        if (backupNode == null) {
+            return false;
+        }
+        return Optional.ofNullable(backupNode.get("status"))
+                .map(JsonNode::textValue)
+                .map("In Progress"::equalsIgnoreCase)
+                .orElse(false);
     }
 
     /**
-     * Evaluates one {@code command=details} poll:
+     * Evaluates one {@code command=details} poll against the time we triggered this backup:
      *
      * <ul>
-     *   <li>backup present but not yet complete → still running, returns {@code false} (keep polling);
-     *   <li>backup present and finished → returns {@code true} on success, throws on failure/exception;
-     *   <li>no backup reported at all → throws, because we never saw one finish, so it never completed
-     *       (it was never registered, or the core reloaded and dropped it).
+     *   <li>no backup reported at all → throws (we never saw one finish, so it never completed);
+     *   <li>a backup whose {@code startTime} is at/after {@code triggerTime} is <b>ours</b>:
+     *       {@code success} → finished ({@code true}); {@code In Progress} → keep polling ({@code false});
+     *       anything else → throws (our backup failed);
+     *   <li>a backup whose {@code startTime} is before {@code triggerTime} is the previous one still showing
+     *       before ours registers → keep polling; unless it is {@code In Progress}, which means a foreign
+     *       backup is already running on the core → throws;
+     *   <li>a backup with no {@code startTime} yet (transient) → keep polling.
      * </ul>
      *
      * <p>Whenever a backup is reported, its snapshot directory name is captured into {@code snapshotDirectory}
      * so a failed backup's files can be located and deleted afterwards.
      */
-    private boolean isBackupFinished(
+    boolean isBackupFinished(
             JsonNode responseNode,
             AtomicReference<String> snapshotDirectory,
+            LocalDateTime triggerTime,
             String shardName,
             String coreName,
             String leaderUrl,
             String collection) {
-        JsonNode backupNode = Optional.ofNullable(responseNode.get("details"))
-                .map(detailsNode -> detailsNode.get("backup"))
-                .filter(node -> !node.isNull())
-                .orElse(null);
+        JsonNode backupNode = backupNode(responseNode);
 
         if (backupNode == null) {
             // No backup reported and we never saw one finish — the backup failed to complete. Fail this
@@ -94,30 +115,35 @@ public class ShardBackupExecutor {
                 .filter(name -> !name.isBlank())
                 .ifPresent(snapshotDirectory::set);
 
-        boolean isFinished = Optional.ofNullable(backupNode.get("endTime"))
+        String status = Optional.ofNullable(backupNode.get("status"))
+                .map(JsonNode::textValue)
+                .orElse(null);
+        LocalDateTime startTime = Optional.ofNullable(backupNode.get("startTime"))
                 .map(JsonNode::textValue)
                 .map(dateStr -> LocalDateTime.parse(dateStr, DateTimeFormatter.ISO_DATE_TIME))
-                .map(this::isEndTimeBelowAllowedDelta)
-                .flatMap(isFresh -> isFresh
-                        ? Optional.ofNullable(backupNode.get("status"))
-                                .map(JsonNode::textValue)
-                                .map(value -> value.equals("success"))
-                                .map(isSuccess -> {
-                                    if (!isSuccess) {
-                                        throw new RuntimeException("Backup status was unsuccessful");
-                                    }
+                .orElse(null);
 
-                                    return true;
-                                })
-                        : Optional.of(false))
-                .orElseGet(() -> {
-                    Optional.ofNullable(backupNode.get(1))
-                            .map(JsonNode::textValue)
-                            .ifPresent((exceptionValue -> {
-                                throw new RuntimeException("Backup encountered an exception - " + exceptionValue);
-                            }));
-                    return false;
-                });
+        boolean isFinished;
+        if (startTime != null && !startTime.isBefore(triggerTime)) {
+            // Our backup: it started at or after we triggered it.
+            if ("success".equalsIgnoreCase(status)) {
+                isFinished = true;
+            } else if ("In Progress".equalsIgnoreCase(status)) {
+                isFinished = false;
+            } else {
+                throw new RuntimeException("Backup status was unsuccessful" + exceptionSuffix(backupNode));
+            }
+        } else if (startTime != null) {
+            // A backup that started before we triggered — the previous one, or a foreign run.
+            if ("In Progress".equalsIgnoreCase(status)) {
+                throw new RuntimeException("A backup is already in progress on this core");
+            }
+            // Previous, completed backup still showing before ours registers — keep polling.
+            isFinished = false;
+        } else {
+            // No startTime reported yet (transient) — keep polling.
+            isFinished = false;
+        }
 
         logStatus(isFinished, shardName, coreName, leaderUrl, collection);
         return isFinished;
@@ -135,12 +161,48 @@ public class ShardBackupExecutor {
                 .log();
     }
 
+    /**
+     * Polls {@code command=details} once before triggering a backup and errors if one is already running on
+     * the core. Solr does not serialize backups (a second {@code command=backup} would run in parallel against
+     * a single shared status field), so we refuse to start ours while another is in progress. The error flows
+     * through the caller's retry logic, so a finishing backup self-heals on a later attempt.
+     */
+    private Mono<Void> ensureCoreIdle(String leaderUrl, String coreName) {
+        try {
+            var detailsRequest = webClient
+                    .get()
+                    .uri(new URIBuilder(leaderUrl)
+                            .setPath("solr/" + coreName + "/replication")
+                            .addParameter("command", "details")
+                            .build());
+
+            return detailsRequest
+                    .retrieve()
+                    .bodyToMono(String.class)
+                    .flatMap(response -> {
+                        try {
+                            if (isBackupInProgress(objectMapper.readTree(response))) {
+                                return Mono.error(
+                                        new RuntimeException("A backup is already in progress on this core"));
+                            }
+                            return Mono.empty();
+                        } catch (JsonProcessingException e) {
+                            return Mono.error(new RuntimeException(e));
+                        }
+                    })
+                    .then();
+        } catch (URISyntaxException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
     private Mono<Void> checkBackupStatus(
             String leaderUrl,
             String coreName,
             String shardName,
             String collection,
-            AtomicReference<String> snapshotDirectory) {
+            AtomicReference<String> snapshotDirectory,
+            LocalDateTime triggerTime) {
         try {
             var backupStatusRequest = webClient
                     .get()
@@ -161,6 +223,7 @@ public class ShardBackupExecutor {
                                     return isBackupFinished(
                                             objectMapper.readTree(statusResponse),
                                             snapshotDirectory,
+                                            triggerTime,
                                             shardName,
                                             coreName,
                                             leaderUrl,
@@ -305,8 +368,13 @@ public class ShardBackupExecutor {
                     .addKeyValue("attempt", attempt)
                     .log();
 
-            return sendBackupRequest(leaderUrl, coreName, shardName, alias)
-                    .then(checkBackupStatus(leaderUrl, coreName, shardName, collection, snapshotDirectory))
+            return ensureCoreIdle(leaderUrl, coreName)
+                    .then(Mono.defer(() -> {
+                        LocalDateTime triggerTime = LocalDateTime.now(ZoneOffset.UTC);
+                        return sendBackupRequest(leaderUrl, coreName, shardName, alias)
+                                .then(checkBackupStatus(
+                                        leaderUrl, coreName, shardName, collection, snapshotDirectory, triggerTime));
+                    }))
                     .doOnSuccess(ignored -> dashboardState.finishAttempt(alias, shardName, ShardStatus.SUCCESS, null))
                     .doOnError(e -> {
                         String message = extractErrorMessage(e);

@@ -14,7 +14,6 @@ solr:
     status-every: 10S
     initial-status-delay: 3S
     between-aliases-delay: 15S
-    max-end-time-delta: 30M
     report-output-directory: /mnt/backups/backups/solr9/reports/
     report-update-interval: 5S
   auth:
