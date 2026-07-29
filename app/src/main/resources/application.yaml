@@ -9,10 +9,9 @@ solr:
   backup:
     parallel-backups: 2
     retries: 2
-    retry-delay: 10S
+    retry-delay: 20S
     backups-mount: /mnt/backups/backups/solr9/
     status-every: 10S
-    initial-status-delay: 3S
     between-aliases-delay: 15S
     report-output-directory: /mnt/backups/backups/solr9/reports/
     report-update-interval: 5S

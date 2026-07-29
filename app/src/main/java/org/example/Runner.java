@@ -70,6 +70,19 @@ public class Runner implements ApplicationRunner {
         return List.of(new AliasTarget(alias, collection));
     }
 
+    /**
+     * The shard's leader replica as cluster state currently sees it, or {@code null} when the collection,
+     * the shard or its leader is gone. Called once per backup attempt: a retry usually follows the node
+     * failure that moved the leader, so the replica resolved when the run started is exactly the one that
+     * should not be retried against.
+     */
+    private static Replica currentLeader(CloudSolrClient client, String collection, String shardName) {
+        return Optional.ofNullable(client.getClusterState().getCollectionOrNull(collection))
+                .map(docCollection -> docCollection.getSlice(shardName))
+                .map(Slice::getLeader)
+                .orElse(null);
+    }
+
     @Override
     public void run(ApplicationArguments args) throws IOException {
         log.info("Initiating backups");
@@ -126,14 +139,14 @@ public class Runner implements ApplicationRunner {
                     .flatMap(
                             aliasedSlice -> {
                                 Slice slice = aliasedSlice.slice();
-                                Replica leader = slice.getLeader();
 
                                 return shardBackupExecutor.backupShard(
                                         aliasedSlice.alias(),
                                         slice.getCollection(),
                                         slice.getName(),
-                                        leader.getCoreName(),
-                                        leader.getCoreUrl());
+                                        // Re-read cluster state per attempt rather than closing over this
+                                        // slice's startup leader, which a failover would leave stale.
+                                        () -> currentLeader(client, slice.getCollection(), slice.getName()));
                             },
                             solrBackupConfiguration.getParallelBackups())
                     .subscribeOn(Schedulers.boundedElastic())

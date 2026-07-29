@@ -174,4 +174,28 @@ public class BackupReportWriterTest {
         assertEquals("boom", shard.attempts().get(0).error());
         assertEquals(ShardStatus.SUCCESS, shard.attempts().get(1).status());
     }
+
+    @Test
+    public void perAttemptFileProgressReachesTheReport() {
+        SolrBackupConfiguration config = config("/tmp/unused");
+        DashboardState state = dashboardState();
+
+        // A shard that dies mid-copy on its first attempt, then succeeds on the retry.
+        register(state, "Books", "books_v2", "shard1");
+        state.startAttempt("Books", "shard1", 1);
+        state.updateAttemptProgress("Books", "shard1", 500, 30);
+        state.finishAttempt("Books", "shard1", ShardStatus.ERROR, "boom");
+        state.startAttempt("Books", "shard1", 2);
+        state.updateAttemptProgress("Books", "shard1", 500, 300);
+        state.finishAttempt("Books", "shard1", ShardStatus.SUCCESS, null);
+
+        RunReport.ShardReport shard =
+                writer(config, state).buildReport().collections().get(0).shards().get(0);
+
+        // The failed attempt keeps the progress it died at.
+        assertEquals(Integer.valueOf(500), shard.attempts().get(0).fileCount());
+        assertEquals(Integer.valueOf(30), shard.attempts().get(0).finishedFileCount());
+        // A succeeded attempt copied every file, even though polling missed the last progress report.
+        assertEquals(Integer.valueOf(500), shard.attempts().get(1).finishedFileCount());
+    }
 }

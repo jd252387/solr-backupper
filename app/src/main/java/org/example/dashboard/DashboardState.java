@@ -9,6 +9,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.UnaryOperator;
 import org.springframework.core.env.Environment;
 import org.springframework.stereotype.Service;
 
@@ -95,7 +96,7 @@ public class DashboardState {
         shards.computeIfPresent(key(alias, shardName), (key, previous) -> {
             Instant now = Instant.now();
             List<ShardAttempt> attempts = new ArrayList<>(previous.attempts());
-            attempts.add(new ShardAttempt(attemptNumber, ShardStatus.RUNNING, now, null, null, null));
+            attempts.add(new ShardAttempt(attemptNumber, ShardStatus.RUNNING, now, null, null, null, null, null));
             Instant shardStartedAt = previous.startedAt() != null ? previous.startedAt() : now;
             return new ShardState(
                     previous.alias(), previous.collection(), previous.shardName(),
@@ -106,20 +107,50 @@ public class DashboardState {
 
     /** Completes the current (most recent) attempt with its outcome; the shard's overall status is unchanged. */
     public void finishAttempt(String alias, String shardName, ShardStatus attemptStatus, String error) {
+        updateLastAttempt(alias, shardName, last -> {
+            Instant finishedAt = Instant.now();
+            // A successful attempt copied every file, but polling usually misses Solr's final progress
+            // report — so complete the count rather than leaving a "SUCCESS at 300/500" row behind.
+            Integer finishedFileCount = (attemptStatus == ShardStatus.SUCCESS && last.fileCount() != null)
+                    ? last.fileCount()
+                    : last.finishedFileCount();
+            return new ShardAttempt(
+                    last.attempt(),
+                    attemptStatus,
+                    last.startedAt(),
+                    finishedAt,
+                    Duration.between(last.startedAt(), finishedAt),
+                    error,
+                    last.fileCount(),
+                    finishedFileCount);
+        });
+    }
+
+    /**
+     * Records the file-copy progress Solr reports for the current (most recent) attempt while its backup
+     * runs, so the dashboard can show a live per-shard progress bar.
+     */
+    public void updateAttemptProgress(String alias, String shardName, int fileCount, int finishedFileCount) {
+        updateLastAttempt(
+                alias,
+                shardName,
+                last -> new ShardAttempt(
+                        last.attempt(),
+                        last.status(),
+                        last.startedAt(),
+                        last.finishedAt(),
+                        last.duration(),
+                        last.error(),
+                        fileCount,
+                        finishedFileCount));
+    }
+
+    /** Replaces the shard's most recent attempt, leaving the shard's own fields untouched. No-op if none. */
+    private void updateLastAttempt(String alias, String shardName, UnaryOperator<ShardAttempt> update) {
         shards.computeIfPresent(key(alias, shardName), (key, previous) -> {
             List<ShardAttempt> attempts = new ArrayList<>(previous.attempts());
             if (!attempts.isEmpty()) {
-                ShardAttempt last = attempts.get(attempts.size() - 1);
-                Instant finishedAt = Instant.now();
-                attempts.set(
-                        attempts.size() - 1,
-                        new ShardAttempt(
-                                last.attempt(),
-                                attemptStatus,
-                                last.startedAt(),
-                                finishedAt,
-                                Duration.between(last.startedAt(), finishedAt),
-                                error));
+                attempts.set(attempts.size() - 1, update.apply(attempts.get(attempts.size() - 1)));
             }
             return new ShardState(
                     previous.alias(), previous.collection(), previous.shardName(),
@@ -127,6 +158,20 @@ public class DashboardState {
                     previous.status(), previous.startedAt(), previous.finishedAt(), previous.error(),
                     List.copyOf(attempts));
         });
+    }
+
+    /**
+     * Points the shard at the leader replica the current attempt resolved. The leader can move between
+     * attempts (that is usually why a retry happens), and the report should name the core actually used.
+     */
+    public void updateLeader(String alias, String shardName, String coreName, String leaderUrl) {
+        shards.computeIfPresent(
+                key(alias, shardName),
+                (key, previous) -> new ShardState(
+                        previous.alias(), previous.collection(), previous.shardName(),
+                        coreName, leaderUrl,
+                        previous.status(), previous.startedAt(), previous.finishedAt(), previous.error(),
+                        previous.attempts()));
     }
 
     /** Sets the shard's terminal overall outcome ({@code SUCCESS}/{@code ERROR}) once all attempts are done. */

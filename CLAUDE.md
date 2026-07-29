@@ -50,32 +50,42 @@ Everything lives under `app/src/main/java/org/example/`. There is a single Gradl
      `System.exit(0)`s — pure run-and-exit, no keep-alive.
 - **`ShardBackupExecutor`** — executes one shard's backup: creates the on-disk backup directory
   (`{backups-mount}/{alias}/{shard}`), calls the shard leader replica's native Solr replication handler
-  (`?command=backup&location=...` to start, then repeatedly polls `?command=details` until a backup whose
-  reported `startTime` is at or after the moment we triggered it — `startTime >= triggerTime`, distinguishing
-  our backup from any previous one whose completion is still being reported — has `status=success`; a
-  non-success status or an exception detail in the response throws). Before triggering, it polls
-  `?command=details` once and refuses to start (a retryable `A backup is already in progress on this core`
-  error) if a backup is already `In Progress`, because Solr does not serialize concurrent backups — a second
-  `command=backup` would run in parallel against a single shared status field. A configurable
-  `initial-status-delay` (default 3s) is applied before the first status poll so a just-triggered backup has
-  time to register on the core. There is **no timeout** — polling continues
+  (`?command=backup&location=...` to start, then repeatedly polls `?command=details` until the reported
+  backup has `status=success`). This **requires the patched Solr build** (`../solr`, commit `757b3e0`), which
+  publishes `details.backup` while a backup runs rather than only after it finishes: `waiting for commit`
+  (emitted synchronously, before `command=backup` returns) and then `running` with `fileCount` /
+  `finishedFileCount` after every copied file. Both mean "keep polling"; `success` means finished; anything
+  else — including the `{exception: ...}` payload — throws. Because the new backup's status is visible before
+  the trigger call returns, a previous backup's `success` can no longer be mistaken for ours, so no
+  start-time comparison and no initial poll delay are needed. Each `running` report's file counts are
+  recorded onto the shard's current attempt (`DashboardState.updateAttemptProgress`) and reach the report as
+  live per-attempt progress. Before triggering, it polls `?command=details` once and refuses to start (a
+  retryable `A backup is already in progress on this core` error) if a backup is still `waiting for commit`
+  or `running`, because Solr does not serialize concurrent backups — a second `command=backup` would run in
+  parallel against a single shared status field. There is **no timeout** — polling continues
   until the core reports success or failure. If a poll reports no backup at all (and none has finished),
   that is treated as a failure with the message `Core stopped updating on backup at <time>`. A failed
-  attempt is retried up to `retries` (default 2) times (`attemptBackup` wrapped in `Retry.fixedDelay`, waiting `retry-delay` — default 10s — between attempts); a shard
-  that succeeds on any attempt is `SUCCESS`, and only a shard that fails every attempt is `ERROR`. Every
+  attempt is retried up to `retries` (default 2) times (`attemptBackup` wrapped in `Retry.fixedDelay`, waiting `retry-delay` — default 20s — between attempts); a shard
+  that succeeds on any attempt is `SUCCESS`, and only a shard that fails every attempt is `ERROR`. **Each
+  attempt resolves the shard's leader afresh** through the `Supplier<Replica>` `Runner` passes in
+  (`Runner.currentLeader` re-reads cluster state), because a retry usually follows the very failure that
+  moved the leader — retrying against the replica that led when the run started would keep hitting a node
+  that no longer leads. The resolved leader is written back onto the shard
+  (`DashboardState.updateLeader`) so the report names the core actually used; a shard with no elected
+  leader fails the attempt (`Shard has no elected leader`) and retries. Every
   attempt is recorded in `DashboardState` (`startAttempt`/`finishAttempt`, each with its own
-  start/finish/error), and each failed attempt's partial snapshot is deleted from disk
+  start/finish/error/file progress), and each failed attempt's partial snapshot is deleted from disk
   (`deleteFailedBackup`: the exact `snapshot.*` directory Solr reported in `directoryName`, under
   `{backups-mount}/{alias}/{shard}`, leaving any earlier good snapshots intact), logging
   `Deleted failed backup` with the removed path so failed replications don't linger on the mount. A failing
   shard never fails the whole run — one bad shard never blocks the rest. Takes plain identifying strings
-  (alias/collection/shard/core/leader URL) rather than live Solr `Slice`/`Replica` objects.
+  (alias/collection/shard) plus the leader supplier, rather than a live Solr `Slice`.
 - **`configuration/SolrBackupConfiguration`** — `@ConfigurationProperties("solr.backup")`: zookeeper
   connection string, alias whitelist, backups mount path, parallelism, poll interval (`status-every`),
   and report output directory.
-  `report-update-interval` (the live-write cadence), `initial-status-delay` (the wait before the first
-  status poll, default 3s), `between-aliases-delay` (the stagger between aliases, default 15s), and
-  `retries` (per-shard backup retries, default 2) carry in-code defaults so existing config still binds.
+  `report-update-interval` (the live-write cadence), `between-aliases-delay` (the stagger between aliases,
+  default 15s), and `retries` (per-shard backup retries, default 2) carry in-code defaults so existing
+  config still binds. `status-every` also sets how often live file progress refreshes.
   The report's `cluster` / `environment` are **not**
   config properties — both are taken from the active Spring profile (`spring.profiles.active`) in
   `DashboardState`, so there is a single source of truth.
@@ -89,7 +99,10 @@ Everything lives under `app/src/main/java/org/example/`. There is a single Gradl
     every transition. `BackupReportWriter` snapshots it to build the on-disk `RunReport`.
   - `ShardState` / `ShardStatus` / `ShardAttempt` — the per-shard record (overall four-state lifecycle
     `PENDING`/`RUNNING`/`SUCCESS`/`ERROR`) plus a `ShardAttempt` list, one entry per backup attempt
-    (initial try + retries), each with its own status/start/finish/error.
+    (initial try + retries), each with its own status/start/finish/error and the `fileCount` /
+    `finishedFileCount` Solr reports while copying (null until the core resolves its file list, so a failed
+    attempt keeps the progress it died at; a succeeded attempt is completed to `fileCount`, since polling
+    usually misses Solr's final progress report).
 - **`report/`** — the live report, kept separate from orchestration in `Runner`:
   - `RunReport` (+ nested `Counts`, `CollectionReport`, `ShardReport` with per-attempt `Attempt` rows) and
     `RunStatus` (`ACTIVE`/`SUCCESS`/`ERROR`) — the run-scoped, per-shard model serialized to disk. Each
@@ -115,7 +128,7 @@ Everything lives under `app/src/main/java/org/example/`. There is a single Gradl
 
 Both `solr.backup.*` and `solr.auth.*` values are required at startup with no defaults in code — missing
 properties will fail Spring's configuration-properties binding. The deliberate exceptions are
-`report-update-interval`, `initial-status-delay`, `between-aliases-delay`, and `retries`, which carry
+`report-update-interval`, `between-aliases-delay`, and `retries`, which carry
 in-code defaults so existing deployments keep binding without config changes. The report's `cluster` /
 `environment` are not `solr.backup.*` properties at all — they come from `spring.profiles.active`.
 
