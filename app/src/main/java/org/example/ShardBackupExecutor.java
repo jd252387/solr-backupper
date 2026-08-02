@@ -10,18 +10,19 @@ import java.net.URISyntaxException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
-import java.time.LocalDateTime;
-import java.time.ZoneOffset;
-import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.util.Comparator;
+import java.util.Locale;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 import java.util.stream.Stream;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.http.client.utils.URIBuilder;
+import org.apache.solr.common.cloud.Replica;
 import org.example.configuration.SolrBackupConfiguration;
 import org.example.dashboard.DashboardState;
 import org.example.dashboard.ShardStatus;
@@ -36,8 +37,8 @@ import reactor.util.retry.Retry;
  * outcome into {@link DashboardState}. Each attempt is retried up to {@code solr.backup.retries} times; a
  * shard that succeeds on any attempt is {@code SUCCESS}, and every failed attempt has its partial snapshot
  * deleted from disk so failed replications don't linger on the mount. Extracted from {@link Runner} (which
- * drives the full-run pipeline) so it works from plain identifying strings rather than live
- * {@code Slice}/{@code Replica} objects tied to a single run's ZooKeeper session.
+ * drives the full-run pipeline) so it works from plain identifying strings, plus a supplier that resolves
+ * the shard's leader afresh on every attempt — a retry typically follows the failure that moved the leader.
  */
 @Service
 @RequiredArgsConstructor
@@ -47,6 +48,20 @@ public class ShardBackupExecutor {
     private final WebClient webClient;
     private final ObjectMapper objectMapper;
     private final DashboardState dashboardState;
+
+    /** The status Solr reports once a backup has finished successfully. */
+    private static final String SUCCESS_STATUS = "success";
+
+    /**
+     * The statuses Solr reports while a backup is still running (see {@code SnapShooter}):
+     * {@code waiting for commit} before the index commit — and with it the file list — is resolved, then
+     * {@code running} after every copied file.
+     */
+    private static final Set<String> IN_PROGRESS_STATUSES = Set.of("waiting for commit", "running");
+
+    private static boolean isInProgress(String status) {
+        return status != null && IN_PROGRESS_STATUSES.contains(status.toLowerCase(Locale.ROOT));
+    }
 
     /** Returns {@code details.backup} from a {@code command=details} response, or {@code null}. */
     private static JsonNode backupNode(JsonNode responseNode) {
@@ -63,31 +78,32 @@ public class ShardBackupExecutor {
                 .orElse("");
     }
 
-    /** True when the core's {@code command=details} reports a backup currently {@code In Progress}. */
+    /** True when the core's {@code command=details} reports a backup that is still running. */
     boolean isBackupInProgress(JsonNode responseNode) {
         JsonNode backupNode = backupNode(responseNode);
         if (backupNode == null) {
             return false;
         }
-        return Optional.ofNullable(backupNode.get("status"))
+        return isInProgress(Optional.ofNullable(backupNode.get("status"))
                 .map(JsonNode::textValue)
-                .map("In Progress"::equalsIgnoreCase)
-                .orElse(false);
+                .orElse(null));
     }
 
     /**
-     * Evaluates one {@code command=details} poll against the time we triggered this backup:
+     * Evaluates one {@code command=details} poll of the backup we triggered:
      *
      * <ul>
-     *   <li>no backup reported at all → throws (we never saw one finish, so it never completed);
-     *   <li>a backup whose {@code startTime} is at/after {@code triggerTime} is <b>ours</b>:
-     *       {@code success} → finished ({@code true}); {@code In Progress} → keep polling ({@code false});
-     *       anything else → throws (our backup failed);
-     *   <li>a backup whose {@code startTime} is before {@code triggerTime} is the previous one still showing
-     *       before ours registers → keep polling; unless it is {@code In Progress}, which means a foreign
-     *       backup is already running on the core → throws;
-     *   <li>a backup with no {@code startTime} yet (transient) → keep polling.
+     *   <li>no backup reported at all → throws (Solr publishes a status before {@code command=backup} even
+     *       returns, so the key disappearing means the core stopped reporting on ours);
+     *   <li>{@code success} → finished ({@code true});
+     *   <li>{@code waiting for commit} / {@code running} → keep polling ({@code false}), recording the
+     *       file-copy progress of the {@code running} reports into {@link DashboardState};
+     *   <li>anything else, including the {@code exception} payload → throws (our backup failed).
      * </ul>
+     *
+     * <p>Solr publishes {@code waiting for commit} synchronously, before the trigger request returns, so a
+     * previous backup's {@code success} can no longer be mistaken for ours and no start-time comparison is
+     * needed to tell them apart.
      *
      * <p>Whenever a backup is reported, its snapshot directory name is captured into {@code snapshotDirectory}
      * so a failed backup's files can be located and deleted afterwards.
@@ -95,7 +111,7 @@ public class ShardBackupExecutor {
     boolean isBackupFinished(
             JsonNode responseNode,
             AtomicReference<String> snapshotDirectory,
-            LocalDateTime triggerTime,
+            String alias,
             String shardName,
             String coreName,
             String leaderUrl,
@@ -110,6 +126,7 @@ public class ShardBackupExecutor {
         }
 
         // Remember the snapshot directory Solr created for this backup so a failed one can be deleted later.
+        // In-progress reports carry it too, so it is known even for an attempt that never reaches success.
         Optional.ofNullable(backupNode.get("directoryName"))
                 .map(JsonNode::textValue)
                 .filter(name -> !name.isBlank())
@@ -118,35 +135,33 @@ public class ShardBackupExecutor {
         String status = Optional.ofNullable(backupNode.get("status"))
                 .map(JsonNode::textValue)
                 .orElse(null);
-        LocalDateTime startTime = Optional.ofNullable(backupNode.get("startTime"))
-                .map(JsonNode::textValue)
-                .map(dateStr -> LocalDateTime.parse(dateStr, DateTimeFormatter.ISO_DATE_TIME))
-                .orElse(null);
 
         boolean isFinished;
-        if (startTime != null && !startTime.isBefore(triggerTime)) {
-            // Our backup: it started at or after we triggered it.
-            if ("success".equalsIgnoreCase(status)) {
-                isFinished = true;
-            } else if ("In Progress".equalsIgnoreCase(status)) {
-                isFinished = false;
-            } else {
-                throw new RuntimeException("Backup status was unsuccessful" + exceptionSuffix(backupNode));
-            }
-        } else if (startTime != null) {
-            // A backup that started before we triggered — the previous one, or a foreign run.
-            if ("In Progress".equalsIgnoreCase(status)) {
-                throw new RuntimeException("A backup is already in progress on this core");
-            }
-            // Previous, completed backup still showing before ours registers — keep polling.
+        if (SUCCESS_STATUS.equalsIgnoreCase(status)) {
+            isFinished = true;
+        } else if (isInProgress(status)) {
+            recordProgress(backupNode, alias, shardName);
             isFinished = false;
         } else {
-            // No startTime reported yet (transient) — keep polling.
-            isFinished = false;
+            throw new RuntimeException("Backup status was unsuccessful" + exceptionSuffix(backupNode));
         }
 
         logStatus(isFinished, shardName, coreName, leaderUrl, collection);
         return isFinished;
+    }
+
+    /**
+     * Records the file-copy progress of a {@code running} report. Absent on {@code waiting for commit},
+     * which is published before the index commit — and with it the file list — has been resolved.
+     */
+    private void recordProgress(JsonNode backupNode, String alias, String shardName) {
+        if (backupNode.hasNonNull("fileCount") && backupNode.hasNonNull("finishedFileCount")) {
+            dashboardState.updateAttemptProgress(
+                    alias,
+                    shardName,
+                    backupNode.get("fileCount").asInt(),
+                    backupNode.get("finishedFileCount").asInt());
+        }
     }
 
     private void logStatus(
@@ -166,6 +181,10 @@ public class ShardBackupExecutor {
      * the core. Solr does not serialize backups (a second {@code command=backup} would run in parallel against
      * a single shared status field), so we refuse to start ours while another is in progress. The error flows
      * through the caller's retry logic, so a finishing backup self-heals on a later attempt.
+     *
+     * <p>ponytail: fails closed. Solr holds the last reported status in memory and never resets it, so a node
+     * killed mid-copy keeps reporting {@code running} until the core reloads, and this shard exhausts its
+     * retries and reports {@code ERROR} instead of racing what might still be a live backup.
      */
     private Mono<Void> ensureCoreIdle(String leaderUrl, String coreName) {
         try {
@@ -199,10 +218,10 @@ public class ShardBackupExecutor {
     private Mono<Void> checkBackupStatus(
             String leaderUrl,
             String coreName,
+            String alias,
             String shardName,
             String collection,
-            AtomicReference<String> snapshotDirectory,
-            LocalDateTime triggerTime) {
+            AtomicReference<String> snapshotDirectory) {
         try {
             var backupStatusRequest = webClient
                     .get()
@@ -211,28 +230,27 @@ public class ShardBackupExecutor {
                             .addParameter("command", "details")
                             .build());
 
-            // Wait before the first poll so the freshly triggered backup has time to register on the core;
-            // otherwise an immediate "no backup" reading would wrongly fail the shard.
-            return Mono.delay(solrBackupConfiguration.getInitialStatusDelay())
-                    .then(Mono.defer(() -> backupStatusRequest
-                            .retrieve()
-                            .bodyToMono(String.class)
-                            .repeatWhen(response -> response.delayElements(solrBackupConfiguration.getStatusEvery()))
-                            .takeUntil(statusResponse -> {
-                                try {
-                                    return isBackupFinished(
-                                            objectMapper.readTree(statusResponse),
-                                            snapshotDirectory,
-                                            triggerTime,
-                                            shardName,
-                                            coreName,
-                                            leaderUrl,
-                                            collection);
-                                } catch (JsonProcessingException e) {
-                                    throw new RuntimeException(e);
-                                }
-                            })
-                            .then()));
+            // No initial delay: Solr publishes the backup's status before the trigger request returns, so the
+            // first poll always sees it.
+            return backupStatusRequest
+                    .retrieve()
+                    .bodyToMono(String.class)
+                    .repeatWhen(response -> response.delayElements(solrBackupConfiguration.getStatusEvery()))
+                    .takeUntil(statusResponse -> {
+                        try {
+                            return isBackupFinished(
+                                    objectMapper.readTree(statusResponse),
+                                    snapshotDirectory,
+                                    alias,
+                                    shardName,
+                                    coreName,
+                                    leaderUrl,
+                                    collection);
+                        } catch (JsonProcessingException e) {
+                            throw new RuntimeException(e);
+                        }
+                    })
+                    .then();
         } catch (URISyntaxException e) {
             throw new RuntimeException(e);
         }
@@ -275,9 +293,13 @@ public class ShardBackupExecutor {
      * {@code SUCCESS} and only a shard that fails every attempt is marked {@code ERROR}. Every failed
      * attempt's partial snapshot is deleted from disk. A failing shard never fails the whole run — one bad
      * shard never blocks the rest.
+     *
+     * <p>{@code leaderSupplier} is called once per attempt rather than resolved up front: a retry usually
+     * follows a node or replica falling over, which is exactly when the leader moves, so retrying against
+     * the leader that was current when the run started would keep hitting a replica that no longer leads.
      */
     public Mono<Void> backupShard(
-            String alias, String collection, String shardName, String coreName, String leaderUrl) {
+            String alias, String collection, String shardName, Supplier<Replica> leaderSupplier) {
         return Mono.defer(() -> {
             try {
                 Files.createDirectories(Path.of(solrBackupConfiguration.getBackupsMount(), alias, shardName));
@@ -297,13 +319,13 @@ public class ShardBackupExecutor {
             AtomicInteger attemptNumber = new AtomicInteger(0);
             AtomicReference<String> lastError = new AtomicReference<>();
 
-            return attemptBackup(alias, collection, shardName, coreName, leaderUrl, attemptNumber, lastError)
+            // The leader is resolved per attempt, so these shard-level logs carry no core/leader — every
+            // attempt logs the one it actually used ("Starting shard backup attempt").
+            return attemptBackup(alias, collection, shardName, leaderSupplier, attemptNumber, lastError)
                     .retryWhen(Retry.fixedDelay(maxRetries, solrBackupConfiguration.getRetryDelay())
                             .doBeforeRetry(retrySignal -> log.atWarn()
                                     .setMessage("Retrying shard backup after a failed attempt")
                                     .addKeyValue("shard_name", shardName)
-                                    .addKeyValue("core_name", coreName)
-                                    .addKeyValue("leader_url", leaderUrl)
                                     .addKeyValue("alias", alias)
                                     .addKeyValue("collection", collection)
                                     .addKeyValue("retry", retrySignal.totalRetries() + 1)
@@ -314,8 +336,6 @@ public class ShardBackupExecutor {
                         log.atInfo()
                                 .setMessage("Finished backing-up shard")
                                 .addKeyValue("shard_name", shardName)
-                                .addKeyValue("core_name", coreName)
-                                .addKeyValue("leader_url", leaderUrl)
                                 .addKeyValue("alias", alias)
                                 .addKeyValue("collection", collection)
                                 .addKeyValue("attempts", attemptNumber.get())
@@ -326,8 +346,6 @@ public class ShardBackupExecutor {
                         log.atError()
                                 .setMessage("Shard backup failed after exhausting all retries")
                                 .addKeyValue("shard_name", shardName)
-                                .addKeyValue("core_name", coreName)
-                                .addKeyValue("leader_url", leaderUrl)
                                 .addKeyValue("alias", alias)
                                 .addKeyValue("collection", collection)
                                 .addKeyValue("attempts", attemptNumber.get())
@@ -340,17 +358,16 @@ public class ShardBackupExecutor {
     }
 
     /**
-     * Runs a single backup attempt: records the attempt as {@code RUNNING}, triggers the backup, and polls
-     * until it finishes. On success the attempt is marked {@code SUCCESS}; on failure the attempt is marked
-     * {@code ERROR}, its partial snapshot is deleted, and the error is re-raised so the caller's retry
-     * logic can try again.
+     * Runs a single backup attempt: resolves the shard's <b>current</b> leader, records the attempt as
+     * {@code RUNNING}, triggers the backup, and polls until it finishes. On success the attempt is marked
+     * {@code SUCCESS}; on failure the attempt is marked {@code ERROR}, its partial snapshot is deleted, and
+     * the error is re-raised so the caller's retry logic can try again.
      */
     private Mono<Void> attemptBackup(
             String alias,
             String collection,
             String shardName,
-            String coreName,
-            String leaderUrl,
+            Supplier<Replica> leaderSupplier,
             AtomicInteger attemptNumber,
             AtomicReference<String> lastError) {
         return Mono.defer(() -> {
@@ -358,29 +375,19 @@ public class ShardBackupExecutor {
             AtomicReference<String> snapshotDirectory = new AtomicReference<>();
             dashboardState.startAttempt(alias, shardName, attempt);
 
-            log.atInfo()
-                    .setMessage("Starting shard backup attempt")
-                    .addKeyValue("shard_name", shardName)
-                    .addKeyValue("core_name", coreName)
-                    .addKeyValue("leader_url", leaderUrl)
-                    .addKeyValue("alias", alias)
-                    .addKeyValue("collection", collection)
-                    .addKeyValue("attempt", attempt)
-                    .log();
+            // Resolved inside the chain (rather than before it) so a missing leader — or a resolver that
+            // throws — fails the attempt through the same error handling as a failed backup.
+            return Mono.fromSupplier(leaderSupplier)
+                    .switchIfEmpty(Mono.error(new RuntimeException("Shard has no elected leader")))
+                    .flatMap(leader -> {
+                        String coreName = leader.getCoreName();
+                        String leaderUrl = leader.getCoreUrl();
+                        // Keep the report pointing at the leader this attempt actually used, not the one the
+                        // run started with, so a failover is visible rather than silently misreported.
+                        dashboardState.updateLeader(alias, shardName, coreName, leaderUrl);
 
-            return ensureCoreIdle(leaderUrl, coreName)
-                    .then(Mono.defer(() -> {
-                        LocalDateTime triggerTime = LocalDateTime.now(ZoneOffset.UTC);
-                        return sendBackupRequest(leaderUrl, coreName, shardName, alias)
-                                .then(checkBackupStatus(
-                                        leaderUrl, coreName, shardName, collection, snapshotDirectory, triggerTime));
-                    }))
-                    .doOnSuccess(ignored -> dashboardState.finishAttempt(alias, shardName, ShardStatus.SUCCESS, null))
-                    .doOnError(e -> {
-                        String message = extractErrorMessage(e);
-                        log.atError()
-                                .setMessage("Shard backup attempt failed")
-                                .addKeyValue("error", message)
+                        log.atInfo()
+                                .setMessage("Starting shard backup attempt")
                                 .addKeyValue("shard_name", shardName)
                                 .addKeyValue("core_name", coreName)
                                 .addKeyValue("leader_url", leaderUrl)
@@ -388,10 +395,28 @@ public class ShardBackupExecutor {
                                 .addKeyValue("collection", collection)
                                 .addKeyValue("attempt", attempt)
                                 .log();
+
+                        return ensureCoreIdle(leaderUrl, coreName)
+                                .then(sendBackupRequest(leaderUrl, coreName, shardName, alias))
+                                .then(checkBackupStatus(
+                                        leaderUrl, coreName, alias, shardName, collection, snapshotDirectory));
+                    })
+                    .doOnSuccess(ignored -> dashboardState.finishAttempt(alias, shardName, ShardStatus.SUCCESS, null))
+                    .doOnError(e -> {
+                        String message = extractErrorMessage(e);
+                        log.atError()
+                                .setMessage("Shard backup attempt failed")
+                                .addKeyValue("error", message)
+                                .addKeyValue("shard_name", shardName)
+                                .addKeyValue("alias", alias)
+                                .addKeyValue("collection", collection)
+                                .addKeyValue("attempt", attempt)
+                                .log();
                         dashboardState.finishAttempt(alias, shardName, ShardStatus.ERROR, message);
                         deleteFailedBackup(alias, shardName, snapshotDirectory.get());
                         lastError.set(message);
-                    });
+                    })
+                    .then();
         });
     }
 

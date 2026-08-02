@@ -27,13 +27,6 @@ public class SolrBackupConfiguration {
     private Duration reportUpdateInterval = Duration.ofSeconds(5);
 
     /**
-     * Delay before the first {@code command=details} status poll of a freshly triggered backup, giving the
-     * core time to register it so an initial poll never reads "no backup" and wrongly fails the shard.
-     * Defaulted (like {@link #reportUpdateInterval}) so existing config still binds.
-     */
-    private Duration initialStatusDelay = Duration.ofSeconds(3);
-
-    /**
      * Delay before starting each alias's backups after the first, to stagger load across the cluster (the
      * first alias starts immediately). Defaulted (like {@link #reportUpdateInterval}) so existing config
      * still binds.
@@ -48,8 +41,9 @@ public class SolrBackupConfiguration {
     private int retries = 2;
 
     /**
-     * Delay before retrying a shard's backup after a failed attempt. Defaulted (like {@link #retries}) so
+     * Delay before retrying a shard's backup after a failed attempt — long enough for a leader election to
+     * settle, since each attempt re-resolves the shard's leader. Defaulted (like {@link #retries}) so
      * existing config still binds.
      */
-    private Duration retryDelay = Duration.ofSeconds(10);
+    private Duration retryDelay = Duration.ofSeconds(20);
 }
