@@ -64,7 +64,12 @@ Everything lives under `app/src/main/java/org/example/`. There is a single Gradl
   or `running`, because Solr does not serialize concurrent backups — a second `command=backup` would run in
   parallel against a single shared status field. There is **no timeout** — polling continues
   until the core reports success or failure. If a poll reports no backup at all (and none has finished),
-  that is treated as a failure with the message `Core stopped updating on backup at <time>`. A failed
+  that is treated as a failure with the message `Core stopped updating on backup at <time>`. A failing poll
+  does **not** fail the attempt on its own: the whole polling loop is retried (`Retry.fixedDelay`,
+  `DETAILS_ATTEMPTS` = 3 tries, `status-every` apart) before the error propagates, because the backup itself
+  keeps running on the core and re-reading the status is all a dropped connection or a momentarily absent
+  status needs. `onRetryExhaustedThrow` re-raises the original failure, so the report names the real cause
+  rather than Reactor's `Retries exhausted` wrapper. A failed
   attempt is retried up to `retries` (default 2) times (`attemptBackup` wrapped in `Retry.fixedDelay`, waiting `retry-delay` — default 20s — between attempts); a shard
   that succeeds on any attempt is `SUCCESS`, and only a shard that fails every attempt is `ERROR`. **Each
   attempt resolves the shard's leader afresh** through the `Supplier<Replica>` `Runner` passes in
@@ -78,15 +83,20 @@ Everything lives under `app/src/main/java/org/example/`. There is a single Gradl
   start/finish/error/core/file progress), and each failed attempt's partial snapshot is deleted from disk
   (`deleteFailedBackup`: the exact `snapshot.*` directory Solr reported in `directoryName`, under
   `{backups-mount}/{alias}/{shard}`, leaving any earlier good snapshots intact), logging
-  `Deleted failed backup` with the removed path so failed replications don't linger on the mount. A failing
+  `Deleted failed backup` with the removed path so failed replications don't linger on the mount. The delete
+  waits `delete-failed-backup-delay` (default 10s) first — Solr reports the failure from the thread that was
+  copying files, so the core can still hold handles on the directory — and the error is only re-raised once
+  the cleanup is done, so `retry-delay` runs after that delay rather than alongside it. A failing
   shard never fails the whole run — one bad shard never blocks the rest. Takes plain identifying strings
   (alias/collection/shard) plus the leader supplier, rather than a live Solr `Slice`.
 - **`configuration/SolrBackupConfiguration`** — `@ConfigurationProperties("solr.backup")`: zookeeper
   connection string, alias whitelist, backups mount path, parallelism, poll interval (`status-every`),
   and report output directory.
   `report-update-interval` (the live-write cadence), `between-aliases-delay` (the stagger between aliases,
-  default 15s), and `retries` (per-shard backup retries, default 2) carry in-code defaults so existing
-  config still binds. `status-every` also sets how often live file progress refreshes.
+  default 15s), `retries` (per-shard backup retries, default 2), and `delete-failed-backup-delay` (the pause
+  before a failed attempt's partial snapshot is deleted, default 10s) carry in-code defaults so existing
+  config still binds. `status-every` also sets how often live file progress refreshes, and how long the
+  status poll waits before re-trying a failed poll.
   The report's `cluster` / `environment` are **not**
   config properties — both are taken from the active Spring profile (`spring.profiles.active`) in
   `DashboardState`, so there is a single source of truth.
@@ -131,7 +141,7 @@ Everything lives under `app/src/main/java/org/example/`. There is a single Gradl
 
 Both `solr.backup.*` and `solr.auth.*` values are required at startup with no defaults in code — missing
 properties will fail Spring's configuration-properties binding. The deliberate exceptions are
-`report-update-interval`, `between-aliases-delay`, and `retries`, which carry
+`report-update-interval`, `between-aliases-delay`, `retries`, and `delete-failed-backup-delay`, which carry
 in-code defaults so existing deployments keep binding without config changes. The report's `cluster` /
 `environment` are not `solr.backup.*` properties at all — they come from `spring.profiles.active`.
 

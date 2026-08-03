@@ -30,6 +30,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.reactive.function.client.WebClientResponseException;
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 import reactor.util.retry.Retry;
 
 /**
@@ -58,6 +59,14 @@ public class ShardBackupExecutor {
      * {@code running} after every copied file.
      */
     private static final Set<String> IN_PROGRESS_STATUSES = Set.of("waiting for commit", "running");
+
+    /**
+     * How many times the status poll is tried before the attempt is failed. A single bad
+     * {@code command=details} — a dropped connection, a core that momentarily reports no backup — shouldn't
+     * cost the attempt (and with it the copied files), so polling restarts from scratch up to this many times
+     * before the error is propagated.
+     */
+    private static final int DETAILS_ATTEMPTS = 3;
 
     private static boolean isInProgress(String status) {
         return status != null && IN_PROGRESS_STATUSES.contains(status.toLowerCase(Locale.ROOT));
@@ -250,6 +259,23 @@ public class ShardBackupExecutor {
                             throw new RuntimeException(e);
                         }
                     })
+                    // A failed poll restarts the whole polling loop rather than failing the attempt outright:
+                    // the backup itself is still running on the core, so re-reading the status is all that is
+                    // needed to pick it back up. Only after DETAILS_ATTEMPTS polls have failed does the
+                    // attempt fail — with the original error, not Reactor's "Retries exhausted" wrapper, so
+                    // the report still names what actually went wrong.
+                    .retryWhen(Retry.fixedDelay(DETAILS_ATTEMPTS - 1L, solrBackupConfiguration.getStatusEvery())
+                            .doBeforeRetry(retrySignal -> log.atWarn()
+                                    .setMessage("Retrying backup status poll")
+                                    .addKeyValue("shard_name", shardName)
+                                    .addKeyValue("core_name", coreName)
+                                    .addKeyValue("leader_url", leaderUrl)
+                                    .addKeyValue("collection", collection)
+                                    .addKeyValue("poll_attempt", retrySignal.totalRetries() + 2)
+                                    .addKeyValue("poll_attempts", DETAILS_ATTEMPTS)
+                                    .addKeyValue("error", extractErrorMessage(retrySignal.failure()))
+                                    .log())
+                            .onRetryExhaustedThrow((spec, retrySignal) -> retrySignal.failure()))
                     .then();
         } catch (URISyntaxException e) {
             throw new RuntimeException(e);
@@ -360,8 +386,9 @@ public class ShardBackupExecutor {
     /**
      * Runs a single backup attempt: resolves the shard's <b>current</b> leader, records the attempt as
      * {@code RUNNING}, triggers the backup, and polls until it finishes. On success the attempt is marked
-     * {@code SUCCESS}; on failure the attempt is marked {@code ERROR}, its partial snapshot is deleted, and
-     * the error is re-raised so the caller's retry logic can try again.
+     * {@code SUCCESS}; on failure the attempt is marked {@code ERROR}, its partial snapshot is deleted after
+     * {@code solr.backup.delete-failed-backup-delay}, and the error is re-raised so the caller's retry logic
+     * can try again.
      */
     private Mono<Void> attemptBackup(
             String alias,
@@ -413,9 +440,16 @@ public class ShardBackupExecutor {
                                 .addKeyValue("attempt", attempt)
                                 .log();
                         dashboardState.finishAttempt(alias, shardName, ShardStatus.ERROR, message);
-                        deleteFailedBackup(alias, shardName, snapshotDirectory.get());
                         lastError.set(message);
                     })
+                    // The core reports the failure from the thread that was copying files, so let it settle
+                    // before removing the partial snapshot underneath it. The error is re-raised only once the
+                    // cleanup is done, so the caller's retry delay runs after this one rather than alongside.
+                    .onErrorResume(e -> Mono.delay(solrBackupConfiguration.getDeleteFailedBackupDelay())
+                            // Deleting a snapshot is blocking file I/O — keep it off the timer thread.
+                            .publishOn(Schedulers.boundedElastic())
+                            .doOnNext(ignored -> deleteFailedBackup(alias, shardName, snapshotDirectory.get()))
+                            .then(Mono.error(e)))
                     .then();
         });
     }

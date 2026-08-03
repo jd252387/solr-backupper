@@ -46,4 +46,13 @@ public class SolrBackupConfiguration {
      * existing config still binds.
      */
     private Duration retryDelay = Duration.ofSeconds(20);
+
+    /**
+     * Delay between a failed attempt and deleting the partial snapshot it left behind. Solr reports the
+     * failure from the thread that was copying files, so the core can still have file handles open on the
+     * snapshot directory when the status flips — deleting straight away races that. {@link #retryDelay} then
+     * runs on top of this, so the next attempt starts once both have elapsed. Defaulted (like
+     * {@link #retryDelay}) so existing config still binds; a slow mount may want longer.
+     */
+    private Duration deleteFailedBackupDelay = Duration.ofSeconds(10);
 }
