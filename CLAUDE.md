@@ -70,11 +70,12 @@ Everything lives under `app/src/main/java/org/example/`. There is a single Gradl
   attempt resolves the shard's leader afresh** through the `Supplier<Replica>` `Runner` passes in
   (`Runner.currentLeader` re-reads cluster state), because a retry usually follows the very failure that
   moved the leader — retrying against the replica that led when the run started would keep hitting a node
-  that no longer leads. The resolved leader is written back onto the shard
-  (`DashboardState.updateLeader`) so the report names the core actually used; a shard with no elected
-  leader fails the attempt (`Shard has no elected leader`) and retries. Every
-  attempt is recorded in `DashboardState` (`startAttempt`/`finishAttempt`, each with its own
-  start/finish/error/file progress), and each failed attempt's partial snapshot is deleted from disk
+  that no longer leads. The resolved leader is written back onto **both the attempt and the shard**
+  (`DashboardState.updateLeader`) so the report names the core each attempt actually used — a shard-level
+  field alone would only ever name the last one, hiding the failover; a shard with no elected
+  leader fails the attempt (`Shard has no elected leader`) and retries, leaving that attempt's core null.
+  Every attempt is recorded in `DashboardState` (`startAttempt`/`finishAttempt`, each with its own
+  start/finish/error/core/file progress), and each failed attempt's partial snapshot is deleted from disk
   (`deleteFailedBackup`: the exact `snapshot.*` directory Solr reported in `directoryName`, under
   `{backups-mount}/{alias}/{shard}`, leaving any earlier good snapshots intact), logging
   `Deleted failed backup` with the removed path so failed replications don't linger on the mount. A failing
@@ -99,10 +100,12 @@ Everything lives under `app/src/main/java/org/example/`. There is a single Gradl
     every transition. `BackupReportWriter` snapshots it to build the on-disk `RunReport`.
   - `ShardState` / `ShardStatus` / `ShardAttempt` — the per-shard record (overall four-state lifecycle
     `PENDING`/`RUNNING`/`SUCCESS`/`ERROR`) plus a `ShardAttempt` list, one entry per backup attempt
-    (initial try + retries), each with its own status/start/finish/error and the `fileCount` /
+    (initial try + retries), each with its own status/start/finish/error, the `coreName` / `leaderUrl` that
+    attempt resolved (null if it failed before electing a leader), and the `fileCount` /
     `finishedFileCount` Solr reports while copying (null until the core resolves its file list, so a failed
     attempt keeps the progress it died at; a succeeded attempt is completed to `fileCount`, since polling
-    usually misses Solr's final progress report).
+    usually misses Solr's final progress report). The shard's own `coreName` / `leaderUrl` track the most
+    recent leader — the per-attempt pair is the one that survives a failover.
 - **`report/`** — the live report, kept separate from orchestration in `Runner`:
   - `RunReport` (+ nested `Counts`, `CollectionReport`, `ShardReport` with per-attempt `Attempt` rows) and
     `RunStatus` (`ACTIVE`/`SUCCESS`/`ERROR`) — the run-scoped, per-shard model serialized to disk. Each

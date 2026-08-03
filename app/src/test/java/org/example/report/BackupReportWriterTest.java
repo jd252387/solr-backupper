@@ -149,11 +149,14 @@ public class BackupReportWriterTest {
         SolrBackupConfiguration config = config("/tmp/unused");
         DashboardState state = dashboardState();
 
-        // A shard that fails its first attempt and succeeds on the retry.
+        // A shard that fails its first attempt and succeeds on the retry — on a different leader, as a
+        // failover-driven retry does.
         register(state, "Books", "books_v2", "shard1");
         state.startAttempt("Books", "shard1", 1);
+        state.updateLeader("Books", "shard1", "core_a", "http://host-a:8983/solr/core_a/");
         state.finishAttempt("Books", "shard1", ShardStatus.ERROR, "boom");
         state.startAttempt("Books", "shard1", 2);
+        state.updateLeader("Books", "shard1", "core_b", "http://host-b:8983/solr/core_b/");
         state.finishAttempt("Books", "shard1", ShardStatus.SUCCESS, null);
         state.markShardResult("Books", "shard1", ShardStatus.SUCCESS, null);
         state.markRunFinished();
@@ -173,6 +176,11 @@ public class BackupReportWriterTest {
         assertEquals(ShardStatus.ERROR, shard.attempts().get(0).status());
         assertEquals("boom", shard.attempts().get(0).error());
         assertEquals(ShardStatus.SUCCESS, shard.attempts().get(1).status());
+        // Each attempt keeps the leader it actually ran against; the shard keeps the most recent one.
+        assertEquals("core_a", shard.attempts().get(0).coreName());
+        assertEquals("http://host-a:8983/solr/core_a/", shard.attempts().get(0).leaderUrl());
+        assertEquals("core_b", shard.attempts().get(1).coreName());
+        assertEquals("core_b", shard.coreName());
     }
 
     @Test
