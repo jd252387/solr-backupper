@@ -41,8 +41,10 @@ public record RunReport(
 
         /**
          * One backup attempt for the shard, with its own start/finish timing and outcome. {@code duration}
-         * is {@code null} while the attempt is still running. {@code fileCount}/{@code finishedFileCount}
-         * are Solr's file-copy progress for this attempt, {@code null} until the core reports a file list.
+         * is {@code null} while the attempt is still running. {@code coreName}/{@code leaderUrl} are the
+         * leader this attempt resolved — the shard-level pair only names the most recent one, so a failover
+         * is only visible here. {@code fileCount}/{@code finishedFileCount} are Solr's file-copy progress
+         * for this attempt, {@code null} until the core reports a file list.
          */
         public record Attempt(
                 int attempt,
@@ -51,6 +53,8 @@ public record RunReport(
                 Instant finishedAt,
                 Duration duration,
                 String error,
+                String coreName,
+                String leaderUrl,
                 Integer fileCount,
                 Integer finishedFileCount) {}
     }

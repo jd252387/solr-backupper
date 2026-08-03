@@ -96,7 +96,10 @@ public class DashboardState {
         shards.computeIfPresent(key(alias, shardName), (key, previous) -> {
             Instant now = Instant.now();
             List<ShardAttempt> attempts = new ArrayList<>(previous.attempts());
-            attempts.add(new ShardAttempt(attemptNumber, ShardStatus.RUNNING, now, null, null, null, null, null));
+            // No core/leader yet — the attempt is registered before the leader is resolved so that a failed
+            // resolution still produces an attempt row. updateLeader fills them in moments later.
+            attempts.add(new ShardAttempt(
+                    attemptNumber, ShardStatus.RUNNING, now, null, null, null, null, null, null, null));
             Instant shardStartedAt = previous.startedAt() != null ? previous.startedAt() : now;
             return new ShardState(
                     previous.alias(), previous.collection(), previous.shardName(),
@@ -121,6 +124,8 @@ public class DashboardState {
                     finishedAt,
                     Duration.between(last.startedAt(), finishedAt),
                     error,
+                    last.coreName(),
+                    last.leaderUrl(),
                     last.fileCount(),
                     finishedFileCount);
         });
@@ -141,6 +146,8 @@ public class DashboardState {
                         last.finishedAt(),
                         last.duration(),
                         last.error(),
+                        last.coreName(),
+                        last.leaderUrl(),
                         fileCount,
                         finishedFileCount));
     }
@@ -161,10 +168,25 @@ public class DashboardState {
     }
 
     /**
-     * Points the shard at the leader replica the current attempt resolved. The leader can move between
-     * attempts (that is usually why a retry happens), and the report should name the core actually used.
+     * Records the leader replica the current attempt resolved, on both the attempt and the shard. The leader
+     * can move between attempts (that is usually why a retry happens), so the attempt keeps the core it
+     * actually ran against while the shard keeps the most recent one.
      */
     public void updateLeader(String alias, String shardName, String coreName, String leaderUrl) {
+        updateLastAttempt(
+                alias,
+                shardName,
+                last -> new ShardAttempt(
+                        last.attempt(),
+                        last.status(),
+                        last.startedAt(),
+                        last.finishedAt(),
+                        last.duration(),
+                        last.error(),
+                        coreName,
+                        leaderUrl,
+                        last.fileCount(),
+                        last.finishedFileCount()));
         shards.computeIfPresent(
                 key(alias, shardName),
                 (key, previous) -> new ShardState(
