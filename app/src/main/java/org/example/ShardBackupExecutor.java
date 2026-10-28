@@ -147,6 +147,12 @@ public class ShardBackupExecutor {
 
         boolean isFinished;
         if (SUCCESS_STATUS.equalsIgnoreCase(status)) {
+            // A backup that finishes between two polls is never seen running, so its file count would be
+            // lost. Solr's success report still carries fileCount (just not finishedFileCount) — all copied.
+            if (backupNode.hasNonNull("fileCount")) {
+                int fileCount = backupNode.get("fileCount").asInt();
+                dashboardState.updateAttemptProgress(alias, shardName, fileCount, fileCount);
+            }
             isFinished = true;
         } else if (isInProgress(status)) {
             recordProgress(backupNode, alias, shardName);
