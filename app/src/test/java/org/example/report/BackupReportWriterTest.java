@@ -3,12 +3,15 @@ package org.example.report;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Instant;
 import java.util.List;
 import org.example.configuration.SolrBackupConfiguration;
 import org.example.dashboard.DashboardState;
@@ -205,5 +208,31 @@ public class BackupReportWriterTest {
         assertEquals(Integer.valueOf(30), shard.attempts().get(0).finishedFileCount());
         // A succeeded attempt copied every file, even though polling missed the last progress report.
         assertEquals(Integer.valueOf(500), shard.attempts().get(1).finishedFileCount());
+    }
+
+    @Test
+    public void lastProgressAtMovesOnlyWhenTheFileCountChanges() throws Exception {
+        DashboardState state = dashboardState();
+        register(state, "Books", "books_v2", "shard1");
+        state.startAttempt("Books", "shard1", 1);
+        assertNull(lastProgressAt(state));
+
+        state.updateAttemptProgress("Books", "shard1", 500, 30);
+        Instant first = lastProgressAt(state);
+        assertNotNull(first);
+
+        Thread.sleep(5);
+        // Same counts on the next poll: the copy is stalled, so the timestamp must hold.
+        state.updateAttemptProgress("Books", "shard1", 500, 30);
+        assertEquals(first, lastProgressAt(state));
+
+        Thread.sleep(5);
+        state.updateAttemptProgress("Books", "shard1", 500, 31);
+        assertTrue(lastProgressAt(state).isAfter(first));
+    }
+
+    private Instant lastProgressAt(DashboardState state) {
+        return writer(config("/tmp/unused"), state)
+                .buildReport().collections().get(0).shards().get(0).attempts().get(0).lastProgressAt();
     }
 }

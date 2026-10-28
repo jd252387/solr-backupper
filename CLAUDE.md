@@ -114,7 +114,9 @@ Everything lives under `app/src/main/java/org/example/`. There is a single Gradl
     attempt resolved (null if it failed before electing a leader), and the `fileCount` /
     `finishedFileCount` Solr reports while copying (null until the core resolves its file list, so a failed
     attempt keeps the progress it died at; a succeeded attempt is completed to `fileCount`, since polling
-    usually misses Solr's final progress report). The shard's own `coreName` / `leaderUrl` track the most
+    usually misses Solr's final progress report), and `lastProgressAt` — when those counts last changed,
+    stamped by `updateAttemptProgress` only on a change, so a stalled copy keeps its old value (precision is
+    `status-every`; Solr reports no timestamp of its own). The shard's own `coreName` / `leaderUrl` track the most
     recent leader — the per-attempt pair is the one that survives a failover.
 - **`report/`** — the live report, kept separate from orchestration in `Runner`:
   - `RunReport` (+ nested `Counts`, `CollectionReport`, `ShardReport` with per-attempt `Attempt` rows) and

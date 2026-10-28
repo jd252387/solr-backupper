@@ -99,7 +99,7 @@ public class DashboardState {
             // No core/leader yet — the attempt is registered before the leader is resolved so that a failed
             // resolution still produces an attempt row. updateLeader fills them in moments later.
             attempts.add(new ShardAttempt(
-                    attemptNumber, ShardStatus.RUNNING, now, null, null, null, null, null, null, null));
+                    attemptNumber, ShardStatus.RUNNING, now, null, null, null, null, null, null, null, null));
             Instant shardStartedAt = previous.startedAt() != null ? previous.startedAt() : now;
             return new ShardState(
                     previous.alias(), previous.collection(), previous.shardName(),
@@ -127,29 +127,33 @@ public class DashboardState {
                     last.coreName(),
                     last.leaderUrl(),
                     last.fileCount(),
-                    finishedFileCount);
+                    finishedFileCount,
+                    last.lastProgressAt());
         });
     }
 
     /**
      * Records the file-copy progress Solr reports for the current (most recent) attempt while its backup
-     * runs, so the dashboard can show a live per-shard progress bar.
+     * runs, so the dashboard can show a live per-shard progress bar. {@code lastProgressAt} moves only when
+     * the counts actually change, so a repeated report of the same counts shows how long the copy has stalled.
      */
     public void updateAttemptProgress(String alias, String shardName, int fileCount, int finishedFileCount) {
-        updateLastAttempt(
-                alias,
-                shardName,
-                last -> new ShardAttempt(
-                        last.attempt(),
-                        last.status(),
-                        last.startedAt(),
-                        last.finishedAt(),
-                        last.duration(),
-                        last.error(),
-                        last.coreName(),
-                        last.leaderUrl(),
-                        fileCount,
-                        finishedFileCount));
+        updateLastAttempt(alias, shardName, last -> {
+            boolean changed = !Integer.valueOf(fileCount).equals(last.fileCount())
+                    || !Integer.valueOf(finishedFileCount).equals(last.finishedFileCount());
+            return new ShardAttempt(
+                    last.attempt(),
+                    last.status(),
+                    last.startedAt(),
+                    last.finishedAt(),
+                    last.duration(),
+                    last.error(),
+                    last.coreName(),
+                    last.leaderUrl(),
+                    fileCount,
+                    finishedFileCount,
+                    changed ? Instant.now() : last.lastProgressAt());
+        });
     }
 
     /** Replaces the shard's most recent attempt, leaving the shard's own fields untouched. No-op if none. */
@@ -186,7 +190,8 @@ public class DashboardState {
                         coreName,
                         leaderUrl,
                         last.fileCount(),
-                        last.finishedFileCount()));
+                        last.finishedFileCount(),
+                        last.lastProgressAt()));
         shards.computeIfPresent(
                 key(alias, shardName),
                 (key, previous) -> new ShardState(

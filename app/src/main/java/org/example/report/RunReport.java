@@ -44,7 +44,8 @@ public record RunReport(
          * is {@code null} while the attempt is still running. {@code coreName}/{@code leaderUrl} are the
          * leader this attempt resolved — the shard-level pair only names the most recent one, so a failover
          * is only visible here. {@code fileCount}/{@code finishedFileCount} are Solr's file-copy progress
-         * for this attempt, {@code null} until the core reports a file list.
+         * for this attempt, {@code null} until the core reports a file list. {@code lastProgressAt} is
+         * when those counts last changed, as seen by polling.
          */
         public record Attempt(
                 int attempt,
@@ -56,6 +57,7 @@ public record RunReport(
                 String coreName,
                 String leaderUrl,
                 Integer fileCount,
-                Integer finishedFileCount) {}
+                Integer finishedFileCount,
+                Instant lastProgressAt) {}
     }
 }

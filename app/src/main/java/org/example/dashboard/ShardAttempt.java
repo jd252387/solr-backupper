@@ -18,6 +18,10 @@ import java.time.Instant;
  * <p>{@code fileCount}/{@code finishedFileCount} are the file-copy progress Solr reports while the backup
  * runs ({@code status=running} on {@code command=details}). Both are {@code null} until the core resolves
  * its index commit and reports a file list, so a failed attempt keeps the progress it died at.
+ *
+ * <p>{@code lastProgressAt} is when the backupper last saw those counts change — the poll that first
+ * noticed it, so it is only as precise as {@code status-every}. A running attempt whose value stops moving
+ * is a stuck copy. {@code null} until the first progress report.
  */
 public record ShardAttempt(
         int attempt,
@@ -29,4 +33,5 @@ public record ShardAttempt(
         String coreName,
         String leaderUrl,
         Integer fileCount,
-        Integer finishedFileCount) {}
+        Integer finishedFileCount,
+        Instant lastProgressAt) {}
