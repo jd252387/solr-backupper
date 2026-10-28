@@ -76,6 +76,15 @@ public class ShardBackupExecutorTest {
     @Test
     public void success_isFinished() throws Exception {
         assertTrue(evaluate(details("{\"startTime\":\"2026-07-14T10:00:05Z\",\"status\":\"success\",\"fileCount\":500}")));
+        // Finished before any poll saw it running — the count still comes from the success report.
+        assertEquals(Integer.valueOf(500), attempt().fileCount());
+        assertEquals(Integer.valueOf(500), attempt().finishedFileCount());
+    }
+
+    @Test
+    public void success_withoutFileCount_leavesProgressUnset() throws Exception {
+        assertTrue(evaluate(details("{\"startTime\":\"2026-07-14T10:00:05Z\",\"status\":\"success\"}")));
+        assertNull(attempt().fileCount());
     }
 
     @Test
