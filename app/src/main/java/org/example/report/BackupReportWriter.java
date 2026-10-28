@@ -85,7 +85,8 @@ public class BackupReportWriter {
                                                         attempt.coreName(),
                                                         attempt.leaderUrl(),
                                                         attempt.fileCount(),
-                                                        attempt.finishedFileCount()))
+                                                        attempt.finishedFileCount(),
+                                                        attempt.lastProgressAt()))
                                                 .toList()))
                                 .toList()))
                 .toList();
