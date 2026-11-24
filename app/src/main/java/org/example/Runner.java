@@ -41,12 +41,9 @@ public class Runner implements ApplicationRunner {
             String alias, Map<String, List<String>> aliasToCollections, ClusterState clusterState) {
         List<String> collections = aliasToCollections.get(alias);
 
+        // A whitelisted name with no alias behind it is taken as a collection name.
         if (collections == null || collections.isEmpty()) {
-            log.atError()
-                    .setMessage("Alias not found in Solr or points to no collections")
-                    .addKeyValue("alias", alias)
-                    .log();
-            return List.of();
+            collections = List.of(alias);
         }
         if (collections.size() > 1) {
             log.atError()
@@ -61,7 +58,7 @@ public class Runner implements ApplicationRunner {
         DocCollection collection = clusterState.getCollectionOrNull(collectionName);
         if (collection == null) {
             log.atError()
-                    .setMessage("Collection referenced by alias not found in cluster state")
+                    .setMessage("No alias or collection with this name found in cluster state")
                     .addKeyValue("alias", alias)
                     .addKeyValue("collection", collectionName)
                     .log();

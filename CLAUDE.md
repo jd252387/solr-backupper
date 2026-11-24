@@ -34,8 +34,8 @@ Everything lives under `app/src/main/java/org/example/`. There is a single Gradl
 - **`Runner`** (`ApplicationRunner`) — the entire backup pipeline. On startup it:
   1. Connects to ZooKeeper via `CloudSolrClient` to read cluster state and the alias → collection(s) map.
   2. For each whitelisted alias (`solr.backup.whitelist-aliases`), resolves it to exactly one collection
-     (aliases pointing to zero, multiple collections, or missing collections are logged and skipped —
-     `resolveAlias`).
+     (a whitelisted name that is not an alias is taken as a collection name; aliases pointing to multiple
+     collections, or names matching no collection, are logged and skipped — `resolveAlias`).
   3. Registers **every** shard of every resolved collection as `PENDING` in `DashboardState` up front and
      writes an initial report immediately, so the dashboard shows the whole run (all shards pending) from
      the start rather than shards appearing only once they are already running.
